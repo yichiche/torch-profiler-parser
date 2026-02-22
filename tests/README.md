@@ -70,6 +70,6 @@ python tests/generate_baselines.py --list
 | `dsr1_mxfp4_conc1` | mature | MLA, 3 FC + 58 MoE layers |
 | `dsr1_mxfp4_rocm700_conc8` | mature | MLA, 3 FC + 58 MoE layers |
 | `grok2` | partial | MHA, alternating attn/MoE half-layers |
-| `qwen3_coder_next` | known_broken | MLA, 4 FC + 44 MoE layers (auto-xfail) |
+| `qwen3_coder_next` | partial | GDN+MHA hybrid, 3 GDN+MoE + 1 MHA+MoE per 4 layers |
 
 Models with `known_broken` status are automatically marked `xfail` in pytest.

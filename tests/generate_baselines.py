@@ -100,13 +100,12 @@ TRACE_REGISTRY = {
         "layers_per_block": 1,
         "mtp_qseqlen_decode": False,
         "grid_threshold": 10000,
-        "status": "known_broken",
+        "status": "partial",
         "expected_layer_types": {
-            "pattern": "first_n_fc_rest_moe",
-            "first_n_fc": 4,
+            "pattern": "alternating_gdn_mha_moe",
         },
         "stage_coverage_min": 50.0,
-        "type_coverage_min": 50.0,
+        "type_coverage_min": 40.0,
     },
 }
 

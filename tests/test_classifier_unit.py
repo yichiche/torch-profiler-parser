@@ -44,7 +44,7 @@ class TestClassifyType:
             # MoE kernels
             ("fused_moe_kernel", KernelType.MOE),
             ("moe_align_block_size", KernelType.MOE),
-            ("topk_softmax_kernel", KernelType.ATTENTION),  # 'softmax' matches attention first
+            ("topk_softmax_kernel", KernelType.MOE),  # 'topk' matches MOE (checked before attention)
             ("MoeSorting", KernelType.MOE),
             ("MoeFlatmm", KernelType.MOE),
             ("kernel_moe_gemm", KernelType.MOE),

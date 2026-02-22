@@ -48,6 +48,8 @@ class LayerType(Enum):
     MLA_MOE = "MLA+MoE"  # MLA attention + MoE
     MHA_FC = "MHA+FC"  # MHA attention + fully connected
     MHA_MOE = "MHA+MoE"  # MHA attention + MoE
+    GDN_FC = "GDN+FC"  # GDN (gated delta network) attention + fully connected
+    GDN_MOE = "GDN+MoE"  # GDN attention + MoE
     ATTN = "Attn"  # Attention-only half-layer (no MoE/FC)
     MOE = "MoE"  # MoE-only half-layer (no attention)
     FC = "FC"  # FC-only half-layer (no attention)
@@ -235,28 +237,33 @@ class KernelClassifier:
             (re.compile(r"generate_draft_decode|create_extend_after_decode"), Stage.DECODE),
         ]
 
-        # Kernel type patterns
+        # Kernel type patterns (order matters — first match wins)
         self._type_patterns = [
-            # Attention patterns
+            # MoE patterns (before attention to avoid moeSoftmax → attention)
+            (
+                re.compile(
+                    r"fused_moe|moe_align|topk|expert|MoeFlatmm|MoeSorting|"
+                    r"kernel_moe_gemm|kernel_moe_mxgemm|shared_experts|grouped_topk|"
+                    r"moe_fused_gate|_moe_mxfp4_sort|moeSoftmax",
+                    re.IGNORECASE,
+                ),
+                KernelType.MOE,
+            ),
+            # Attention patterns (including GDN / gated delta network)
             (
                 re.compile(
                     r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax|"
                     r"fmha_|FmhaBatchPrefill|mla_reduce|kv_cache|flashinfer|set_mla_kv|"
                     r"kn_entry_2c_sbhd|kn_get_mla_metadata|qk_rope|"
-                    r"concat_and_cast_mha|kn_mla_reduce|paged_attention",
+                    r"concat_and_cast_mha|kn_mla_reduce|paged_attention|"
+                    r"chunk_gated_delta_rule|chunk_fwd_kernel_o|chunk_local_cumsum|"
+                    r"chunk_scaled_dot_kkt|fused_gdn_gating|_causal_conv1d_|"
+                    r"fused_sigmoid_gating_delta_rule|fused_qkvzba_split|"
+                    r"l2norm_fwd|_layer_norm_fwd_1pass|solve_tril|"
+                    r"merge_16x16_to_64x64|recompute_w_u_fwd",
                     re.IGNORECASE,
                 ),
                 KernelType.ATTENTION,
-            ),
-            # MoE patterns
-            (
-                re.compile(
-                    r"fused_moe|moe_align|topk|expert|MoeFlatmm|MoeSorting|"
-                    r"kernel_moe_gemm|kernel_moe_mxgemm|shared_experts|grouped_topk|"
-                    r"moe_fused_gate|_moe_mxfp4_sort",
-                    re.IGNORECASE,
-                ),
-                KernelType.MOE,
             ),
             # Quantization patterns
             (
@@ -281,7 +288,8 @@ class KernelClassifier:
             # Linear/GEMM patterns (after quant to avoid overlap)
             (
                 re.compile(
-                    r"Cijk_Alik_Bljk|_gemm_a16_w16|Custom_Cijk",
+                    r"Cijk_Alik_Bljk|Cijk_Ailk_Bljk|Cijk_SB_|"
+                    r"_gemm_a16_w16|Custom_Cijk",
                     re.IGNORECASE,
                 ),
                 KernelType.LINEAR,
@@ -323,7 +331,7 @@ class KernelClassifier:
             (re.compile(r"dynamic_per_group_scaled_quant"), "DYN_QUANT"),
             (re.compile(r"fused_append_shared_experts"), "SHARED_EXP"),
             (re.compile(r"act_and_mul_kernel"), "ACT_MUL"),
-            (re.compile(r"Cijk_Alik|Custom_Cijk"), "HIPBLAS_GEMM"),
+            (re.compile(r"Cijk_Alik|Cijk_Ailk|Cijk_SB_|Custom_Cijk"), "HIPBLAS_GEMM"),
             (re.compile(r"paged_attention_ll4mi_QKV"), "PA_DECODE"),
             (re.compile(r"paged_attention_ll4mi_reduce"), "PA_REDUCE"),
             (re.compile(r"FmhaBatchPrefill"), "FMHA_PREFILL"),
@@ -341,6 +349,22 @@ class KernelClassifier:
             (re.compile(r"_gemm_a16_w16"), "GEMM_A16W16"),
             (re.compile(r"_fused_flatten"), "FLATTEN_QUANT"),
             (re.compile(r"MoeFlatmm"), "MOE_FLATMM"),
+            (re.compile(r"moeSoftmax"), "MOE_SOFTMAX"),
+            # GDN (gated delta network) kernels — Qwen3-Coder-Next
+            (re.compile(r"chunk_gated_delta_rule"), "GDN_DELTA"),
+            (re.compile(r"chunk_fwd_kernel_o"), "GDN_OUTPUT"),
+            (re.compile(r"fused_gdn_gating"), "GDN_GATE"),
+            (re.compile(r"fused_sigmoid_gating_delta_rule"), "GDN_RECUR"),
+            (re.compile(r"fused_qkvzba_split"), "GDN_QKV_SPLIT"),
+            (re.compile(r"_causal_conv1d_fwd"), "CONV1D_FWD"),
+            (re.compile(r"_causal_conv1d_update"), "CONV1D_UPD"),
+            (re.compile(r"chunk_local_cumsum"), "GDN_CUMSUM"),
+            (re.compile(r"chunk_scaled_dot_kkt"), "GDN_DOT"),
+            (re.compile(r"solve_tril"), "GDN_TRIL"),
+            (re.compile(r"merge_16x16_to_64x64"), "GDN_MERGE"),
+            (re.compile(r"recompute_w_u_fwd"), "GDN_RECOMP"),
+            (re.compile(r"l2norm_fwd"), "L2NORM"),
+            (re.compile(r"_layer_norm_fwd_1pass"), "LAYERNORM"),
         ]
 
     def classify_stage(
@@ -411,10 +435,22 @@ class LayerDetector:
             ),
         ]
 
+        # GDN (gated delta network) attention markers — Qwen3-Coder-Next
+        self._gdn_markers = [
+            re.compile(
+                r"chunk_gated_delta_rule|fused_gdn_gating|"
+                r"fused_sigmoid_gating_delta_rule|"
+                r"_causal_conv1d_|chunk_fwd_kernel_o|"
+                r"chunk_local_cumsum|chunk_scaled_dot_kkt"
+            ),
+        ]
+
         # Attention stage hints for layer stage inference
         self._attention_decode_patterns = [
             re.compile(r"qseqlen1[^0-9]|qseqlen1$|decode_attention|paged_attention_ll4mi", re.IGNORECASE),
             re.compile(r"mla_a8w8.*qseqlen(1|4)", re.IGNORECASE),
+            # GDN decode: recurrent update kernels (vs chunk kernels for prefill)
+            re.compile(r"fused_sigmoid_gating_delta_rule_update|_causal_conv1d_update", re.IGNORECASE),
         ]
         if self._mtp_qseqlen_decode:
             self._attention_decode_patterns.append(
@@ -422,16 +458,43 @@ class LayerDetector:
             )
         self._attention_prefill_patterns = [
             re.compile(r"fmha_fwd|flash_attn|FmhaBatchPrefill", re.IGNORECASE),
+            # GDN prefill: chunk-based kernels (vs recurrent update for decode)
+            re.compile(r"chunk_gated_delta_rule_fwd|fused_gdn_gating|_causal_conv1d_fwd", re.IGNORECASE),
         ]
         if not self._mtp_qseqlen_decode:
             self._attention_prefill_patterns.append(
                 re.compile(r"qseqlen[2-9]|qseqlen\d{2,}", re.IGNORECASE)
             )
 
+    @staticmethod
+    def _preceded_by_allreduce(kernels: List[KernelEvent], lookback: int = 15) -> bool:
+        """Check if ALLREDUCE appeared recently with only OTHER/MEMORY kernels between.
+
+        Models with unfused RMSNorm (e.g. Qwen3-Coder-Next) have a sequence of
+        generic elementwise kernels between ALLREDUCE and the first computational
+        kernel.  This helper looks backward through the kernel list and returns
+        True if ALLREDUCE is found within *lookback* positions with only
+        OTHER / MEMORY typed kernels in between.
+        """
+        for i in range(len(kernels) - 1, max(-1, len(kernels) - 1 - lookback), -1):
+            k = kernels[i]
+            if k.simplified_name == "ALLREDUCE":
+                return True
+            if k.kernel_type not in (KernelType.OTHER, KernelType.MEMORY):
+                return False
+        return False
+
     def detect_layers(self, events: List[KernelEvent]) -> List[LayerEvent]:
         """Detect layer boundaries and classify layers.
 
         Layer stage is determined by the dominant stage of kernels within each layer.
+
+        Two boundary detection strategies:
+        1. Primary: a fused RMSNorm kernel immediately after ALLREDUCE
+           (DeepSeek, Grok, etc.)
+        2. Fallback: first LINEAR (GEMM) kernel after ALLREDUCE when only
+           OTHER/MEMORY kernels appear in between — handles models with
+           unfused normalization (Qwen3-Coder-Next).
         """
         if not events:
             return []
@@ -442,6 +505,7 @@ class LayerDetector:
         in_layer = False
         saw_attention = False
         saw_mla = False
+        saw_gdn = False
         saw_moe = False
         saw_fc = False
 
@@ -457,24 +521,58 @@ class LayerDetector:
             )
             is_layer_start = any(p.search(name) for p in self._layer_start_patterns)
 
-            # Check if this is a MoE, FC, or MLA marker
+            # Fallback: first GEMM after ALLREDUCE + unfused norm sequence.
+            # Only applies when no fused RMSNorm kernel appeared between
+            # ALLREDUCE and this GEMM (otherwise the primary detection
+            # handles it).
+            is_gemm_after_allreduce = False
+            if (
+                not is_layer_start
+                and event.kernel_type == KernelType.LINEAR
+                and len(current_layer_kernels) > 0
+                and self._preceded_by_allreduce(current_layer_kernels)
+            ):
+                # Verify no layer_start pattern kernel exists between
+                # ALLREDUCE and here (otherwise primary path should handle)
+                has_fused_norm = False
+                for j in range(len(current_layer_kernels) - 1, -1, -1):
+                    k = current_layer_kernels[j]
+                    if k.simplified_name == "ALLREDUCE":
+                        break
+                    if any(p.search(k.name) for p in self._layer_start_patterns):
+                        has_fused_norm = True
+                        break
+                if not has_fused_norm:
+                    is_gemm_after_allreduce = True
+
+            # Check if this is a MoE, FC, MLA, or GDN marker
             is_moe = any(p.search(name) for p in self._moe_markers)
             is_fc = any(p.search(name) for p in self._fc_markers)
             is_attention = event.kernel_type == KernelType.ATTENTION
             is_mla = any(p.search(name) for p in self._mla_markers)
+            is_gdn = any(p.search(name) for p in self._gdn_markers)
 
-            # Start a new layer on layer_start after allreduce or at very beginning
+            # Layer boundary: named pattern after ALLREDUCE, or fallback GEMM
+            is_boundary = False
             if is_layer_start and (
                 not in_layer
                 or (
                     len(current_layer_kernels) > 0
-                    and current_layer_kernels[-1].simplified_name == "ALLREDUCE"
+                    and (
+                        current_layer_kernels[-1].simplified_name == "ALLREDUCE"
+                        or self._preceded_by_allreduce(current_layer_kernels)
+                    )
                 )
             ):
+                is_boundary = True
+            elif is_gemm_after_allreduce:
+                is_boundary = True
+
+            if is_boundary:
                 # Save previous layer if exists
                 if current_layer_kernels:
                     layer_type = self._classify_layer_type(
-                        saw_attention, saw_mla, saw_moe, saw_fc
+                        saw_attention, saw_mla, saw_gdn, saw_moe, saw_fc
                     )
                     # Determine stage from kernels
                     stage = self._determine_layer_stage(current_layer_kernels)
@@ -488,17 +586,29 @@ class LayerDetector:
                     )
                     layer_idx += 1
 
-                # Start new layer (include the preceding ALLREDUCE if present)
-                if (
-                    current_layer_kernels
-                    and current_layer_kernels[-1].simplified_name == "ALLREDUCE"
-                ):
-                    current_layer_kernels = [current_layer_kernels[-1], event]
+                # Start new layer — include preceding ALLREDUCE + unfused
+                # norm kernels so they belong to the new layer.
+                allreduce_pos = None
+                for j in range(len(current_layer_kernels) - 1, -1, -1):
+                    if current_layer_kernels[j].simplified_name == "ALLREDUCE":
+                        allreduce_pos = j
+                        break
+                    if current_layer_kernels[j].kernel_type not in (
+                        KernelType.OTHER,
+                        KernelType.MEMORY,
+                    ):
+                        break
+
+                if allreduce_pos is not None:
+                    current_layer_kernels = (
+                        current_layer_kernels[allreduce_pos:] + [event]
+                    )
                 else:
                     current_layer_kernels = [event]
                 in_layer = True
                 saw_attention = False
                 saw_mla = False
+                saw_gdn = False
                 saw_moe = False
                 saw_fc = False
             else:
@@ -509,6 +619,8 @@ class LayerDetector:
                 saw_attention = True
             if is_mla:
                 saw_mla = True
+            if is_gdn:
+                saw_gdn = True
             if is_moe:
                 saw_moe = True
             if is_fc:
@@ -517,7 +629,7 @@ class LayerDetector:
         # Save last layer
         if current_layer_kernels:
             layer_type = self._classify_layer_type(
-                saw_attention, saw_mla, saw_moe, saw_fc
+                saw_attention, saw_mla, saw_gdn, saw_moe, saw_fc
             )
             stage = self._determine_layer_stage(current_layer_kernels)
             layers.append(
@@ -533,12 +645,15 @@ class LayerDetector:
 
     @staticmethod
     def _classify_layer_type(
-        saw_attention: bool, saw_mla: bool, saw_moe: bool, saw_fc: bool
+        saw_attention: bool,
+        saw_mla: bool,
+        saw_gdn: bool,
+        saw_moe: bool,
+        saw_fc: bool,
     ) -> LayerType:
         """Classify layer type from what markers were observed.
 
-        MLA (multi-latent attention) vs MHA (multi-head attention) is
-        determined by whether MLA-specific kernels were seen.
+        Attention variant priority: MLA > GDN > MHA (generic).
         """
         if saw_attention:
             if saw_mla:
@@ -546,6 +661,11 @@ class LayerDetector:
                     return LayerType.MLA_MOE
                 if saw_fc:
                     return LayerType.MLA_FC
+            elif saw_gdn:
+                if saw_moe:
+                    return LayerType.GDN_MOE
+                if saw_fc:
+                    return LayerType.GDN_FC
             else:
                 if saw_moe:
                     return LayerType.MHA_MOE
@@ -596,9 +716,16 @@ class LayerDetector:
                     for k in layer.kernels
                     for p in self._mla_markers
                 )
+                has_gdn = any(
+                    p.search(k.name)
+                    for k in layer.kernels
+                    for p in self._gdn_markers
+                )
                 is_moe = next_layer.layer_type == LayerType.MOE
                 if has_mla:
                     merged_type = LayerType.MLA_MOE if is_moe else LayerType.MLA_FC
+                elif has_gdn:
+                    merged_type = LayerType.GDN_MOE if is_moe else LayerType.GDN_FC
                 else:
                     merged_type = LayerType.MHA_MOE if is_moe else LayerType.MHA_FC
                 combined_kernels = layer.kernels + next_layer.kernels
@@ -993,7 +1120,7 @@ class ReportFormatter:
         for layer in layers:
             moe_fc_time = (
                 layer.moe_time_us
-                if layer.layer_type in (LayerType.MLA_MOE, LayerType.MHA_MOE, LayerType.MOE)
+                if layer.layer_type in (LayerType.MLA_MOE, LayerType.MHA_MOE, LayerType.GDN_MOE, LayerType.MOE)
                 else layer.linear_time_us
             )
             print(

@@ -285,49 +285,68 @@ class TestLayerTypeClassification:
 
     def test_mla_moe(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=True, saw_mla=True, saw_moe=True, saw_fc=False
+            saw_attention=True, saw_mla=True, saw_gdn=False, saw_moe=True, saw_fc=False
         )
         assert result == LayerType.MLA_MOE
 
     def test_mla_fc(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=True, saw_mla=True, saw_moe=False, saw_fc=True
+            saw_attention=True, saw_mla=True, saw_gdn=False, saw_moe=False, saw_fc=True
         )
         assert result == LayerType.MLA_FC
 
     def test_mha_moe(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=True, saw_mla=False, saw_moe=True, saw_fc=False
+            saw_attention=True, saw_mla=False, saw_gdn=False, saw_moe=True, saw_fc=False
         )
         assert result == LayerType.MHA_MOE
 
     def test_mha_fc(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=True, saw_mla=False, saw_moe=False, saw_fc=True
+            saw_attention=True, saw_mla=False, saw_gdn=False, saw_moe=False, saw_fc=True
         )
         assert result == LayerType.MHA_FC
 
+    def test_gdn_moe(self):
+        result = LayerDetector._classify_layer_type(
+            saw_attention=True, saw_mla=False, saw_gdn=True, saw_moe=True, saw_fc=False
+        )
+        assert result == LayerType.GDN_MOE
+
+    def test_gdn_fc(self):
+        result = LayerDetector._classify_layer_type(
+            saw_attention=True, saw_mla=False, saw_gdn=True, saw_moe=False, saw_fc=True
+        )
+        assert result == LayerType.GDN_FC
+
+    def test_mla_over_gdn(self):
+        """MLA takes priority over GDN when both markers are present."""
+        result = LayerDetector._classify_layer_type(
+            saw_attention=True, saw_mla=True, saw_gdn=True, saw_moe=True, saw_fc=False
+        )
+        assert result == LayerType.MLA_MOE
+
     def test_attn_only(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=True, saw_mla=False, saw_moe=False, saw_fc=False
+            saw_attention=True, saw_mla=False, saw_gdn=False, saw_moe=False, saw_fc=False
         )
         assert result == LayerType.ATTN
 
     def test_moe_only(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=False, saw_mla=False, saw_moe=True, saw_fc=False
+            saw_attention=False, saw_mla=False, saw_gdn=False, saw_moe=True, saw_fc=False
         )
         assert result == LayerType.MOE
 
     def test_fc_only(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=False, saw_mla=False, saw_moe=False, saw_fc=True
+            saw_attention=False, saw_mla=False, saw_gdn=False, saw_moe=False, saw_fc=True
         )
         assert result == LayerType.FC
 
     def test_unknown(self):
         result = LayerDetector._classify_layer_type(
-            saw_attention=False, saw_mla=False, saw_moe=False, saw_fc=False
+            saw_attention=False, saw_mla=False, saw_gdn=False, saw_moe=False, saw_fc=False
         )
         assert result == LayerType.UNKNOWN
 
