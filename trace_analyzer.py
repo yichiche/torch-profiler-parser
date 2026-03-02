@@ -230,6 +230,7 @@ class KernelClassifier:
         ]
         self._stage_patterns = [
             (re.compile(r"set_mla_kv_buffer_kernel|concat_and_cast_mha_k_kernel", re.IGNORECASE), Stage.PREFILL),
+            (re.compile(r"_pfl_", re.IGNORECASE), Stage.PREFILL),
             (re.compile(r"qseqlen[1-4][^0-9]|qseqlen[1-4]$", re.IGNORECASE), Stage.DECODE),
             (re.compile(r"qseqlen[5-9]|qseqlen\d{2,}", re.IGNORECASE), Stage.PREFILL),
             (re.compile(r"_decode_|decode_attention|paged_attention_ll4mi", re.IGNORECASE), Stage.DECODE),
