@@ -363,6 +363,7 @@ _KERNEL_CATEGORIES = [
         r"all_reduce|cross_device_reduce|nccl|rccl|broadcast|allgather|reduce_scatter|quickreduce"
         r"|all_to_all",
         re.IGNORECASE)),
+    ("embedding", re.compile(r"embedding|rotary|rope|pos_enc", re.IGNORECASE)),
     ("attention", re.compile(
         r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax|fmha_|FmhaBatchPrefill"
         r"|mla_reduce|kv_cache|flashinfer|set_mla_kv|paged_attention|radix"
@@ -374,32 +375,21 @@ _KERNEL_CATEGORIES = [
         r"mxfp4|fp8|quant|_gemm_afp4|_fused_rms_mxfp4|dynamic_per_group_scaled_quant"
         r"|_dynamic_mxfp4|fp4x2|_gemm_a8w8|_batched_gemm_a8w8|_fused_rms_fp8", re.IGNORECASE)),
     ("gemm", re.compile(
-        r"Cijk_Alik_Bljk|Cijk_Ailk_Bljk|Cijk_SB_|_gemm_a16_w16|Custom_Cijk|gemm|matmul",
+        r"Cijk_Alik_Bljk|Cijk_Ailk_Bljk|Cijk_SB_|_gemm_a16_w16|Custom_Cijk|gemm|matmul|nvjet",
         re.IGNORECASE)),
     ("normalization", re.compile(
         r"layer_norm|rmsnorm|rms_norm|batch_norm|group_norm|scale_shift"
         r"|rsqrt|_mean_pow",
         re.IGNORECASE)),
-    ("activation", re.compile(
-        r"act_and_mul|silu|gelu|relu|swish|sigmoid_gating", re.IGNORECASE)),
     ("conv", re.compile(r"conv2d|conv3d|convolution|Im2Col", re.IGNORECASE)),
-    ("embedding", re.compile(r"embedding|rotary|rope|pos_enc", re.IGNORECASE)),
     ("elementwise", re.compile(
         r"vectorized_elementwise|elementwise_kernel|binary_op|unary_op"
         r"|aten::add|aten::mul|aten::sub|aten::div|aten::neg|aten::abs|aten::clamp"
         r"|add_kernel|mul_kernel|sub_kernel|div_kernel|fused_add|residual_add"
         r"|CastKernel|cast_kernel|type_cast|fused_bias"
         r"|_to_copy|fused_copy_|fused_zeros|fused_any|fused_fill|fused_where"
-        r"|fused_mul_|fused_pow|fused_neg|fused_abs",
-        re.IGNORECASE)),
-    ("reshape", re.compile(
-        r"reshape|permute|transpose|contiguous|CatArrayBatchedCopy"
-        r"|aten::cat|aten::concat|aten::split|aten::chunk|aten::slice|aten::narrow"
-        r"|aten::gather|aten::scatter|aten::index_select|aten::index_copy|aten::index_put"
-        r"|aten::expand|aten::repeat|aten::unsqueeze|aten::squeeze|aten::flatten"
-        r"|aten::view|aten::reshape|aten::permute|aten::transpose|aten::contiguous"
-        r"|scatter_kernel|gather_kernel|index_kernel"
-        r"|clone|fused_view|fused_expand|fused_narrow|fused_split|fused_cat|fused_unsqueeze",
+        r"|fused_mul_|fused_pow|fused_neg|fused_abs"
+        r"|act_and_mul|silu|gelu|relu|swish|sigmoid_gating",
         re.IGNORECASE)),
 ]
 
