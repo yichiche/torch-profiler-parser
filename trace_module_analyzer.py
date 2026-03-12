@@ -57,6 +57,7 @@ class KernelDetail:
     module_path: str  # e.g. "WanTransformerBlock_1/WanT2VCrossAttention_0"
     ts: float = 0.0
     phase: str = ""  # "prefill" / "decode" / ""
+    input_dims: str = ""  # e.g. "[[1, 75600, 10, 128], ...]"
 
 
 @dataclass
@@ -197,20 +198,112 @@ class _IntervalIndex:
         return best
 
 
+class CpuOpShapeIndex:
+    """Map correlation IDs to cpu_op tensor shapes via timestamp containment.
+
+    For each cuda_runtime/cuda_driver launch event, finds the enclosing cpu_op
+    on the same thread and extracts its ``Input Dims`` argument.
+    """
+
+    def __init__(self, cpu_ops: List[Dict], runtime_events: List[Dict],
+                 driver_events: Optional[List[Dict]] = None):
+        # Build interval index of cpu_ops that carry Input Dims
+        shaped_ops: Dict[Tuple[int, int], List[Tuple[float, float, str]]] = defaultdict(list)
+        for op in cpu_ops:
+            dims = op.get("args", {}).get("Input Dims")
+            if not dims:
+                continue
+            ts = op["ts"]
+            dur = op.get("dur", 0)
+            tid = op["tid"]
+            pid = op.get("pid", tid)
+            dims_str = self._format_dims(dims)
+            if dims_str:
+                shaped_ops[(pid, tid)].append((ts, ts + dur, dims_str))
+
+        for key in shaped_ops:
+            shaped_ops[key].sort(key=lambda x: (x[0], -x[1]))
+        self._shaped_ops = shaped_ops
+        self._starts_cache: Dict[Tuple[int, int], List[float]] = {
+            k: [iv[0] for iv in v] for k, v in shaped_ops.items()
+        }
+
+        # Build correlation → shape mapping
+        self._corr_to_shape: Dict[int, str] = {}
+        all_launches = list(runtime_events)
+        if driver_events:
+            all_launches.extend(driver_events)
+        for e in all_launches:
+            corr = e.get("args", {}).get("correlation")
+            if corr is None or corr in self._corr_to_shape:
+                continue
+            ts = e["ts"]
+            tid = e["tid"]
+            pid = e.get("pid", tid)
+            shape = self._find_shape(ts, pid, tid)
+            if shape:
+                self._corr_to_shape[corr] = shape
+
+    def get_shape(self, correlation_id: int) -> str:
+        """Return Input Dims string for a kernel's correlation ID, or ''."""
+        return self._corr_to_shape.get(correlation_id, "")
+
+    def _find_shape(self, ts: float, pid: int, tid: int) -> str:
+        key = (pid, tid)
+        intervals = self._shaped_ops.get(key)
+        if not intervals:
+            return ""
+        starts = self._starts_cache[key]
+        idx = bisect.bisect_right(starts, ts) - 1
+        # Search nearby intervals for the deepest (narrowest) enclosing cpu_op
+        best = ""
+        best_span = float("inf")
+        for i in range(max(0, idx - 5), min(len(intervals), idx + 5)):
+            s, e, dims_str = intervals[i]
+            if s <= ts <= e:
+                span = e - s
+                if span < best_span:
+                    best_span = span
+                    best = dims_str
+            elif s > ts + 100:
+                break
+        return best
+
+    @staticmethod
+    def _format_dims(dims) -> str:
+        """Format Input Dims into a concise string, omitting empty entries."""
+        if not isinstance(dims, list):
+            return ""
+        non_empty = [d for d in dims if isinstance(d, list) and len(d) > 0]
+        if not non_empty:
+            return ""
+        return str(non_empty)
+
+
 class KernelCorrelator:
     """Map GPU kernels to modules via correlation ID chain."""
 
-    def __init__(self, runtime_events: List[Dict], roots: List[ModuleNode]):
-        # Build correlation → runtime event mapping
+    def __init__(self, runtime_events: List[Dict], roots: List[ModuleNode],
+                 driver_events: Optional[List[Dict]] = None):
+        # Build correlation → launch event mapping from both cuda_runtime
+        # and cuda_driver events.  On B200, many kernels are launched via
+        # cuLaunchKernelEx (cuda_driver) instead of cuda_runtime, so both
+        # sources are needed for complete correlation coverage.
         self._corr_to_rt: Dict[int, Dict] = {}
         for e in runtime_events:
             corr = e.get("args", {}).get("correlation")
             if corr is not None:
                 self._corr_to_rt[corr] = e
+        if driver_events:
+            for e in driver_events:
+                corr = e.get("args", {}).get("correlation")
+                if corr is not None and corr not in self._corr_to_rt:
+                    self._corr_to_rt[corr] = e
 
         self._index = _IntervalIndex(roots)
 
-    def correlate(self, kernel_events: List[Dict], roots: List[ModuleNode]) -> int:
+    def correlate(self, kernel_events: List[Dict], roots: List[ModuleNode],
+                  shape_index: Optional["CpuOpShapeIndex"] = None) -> int:
         """Assign each kernel to its deepest enclosing module. Returns count matched."""
         matched = 0
         for k in kernel_events:
@@ -225,6 +318,8 @@ class KernelCorrelator:
             cpu_pid = rt.get("pid", cpu_tid)
             module = self._index.find_deepest(cpu_ts, cpu_pid, cpu_tid)
             if module is not None:
+                if shape_index is not None:
+                    k["_input_dims"] = shape_index.get_shape(corr)
                 module.kernels.append(k)
                 matched += 1
         return matched
@@ -336,7 +431,8 @@ class ModuleAggregator:
             stats.kernel_breakdown[cat] = (prev_dur + dur, prev_cnt + 1)
             stats.kernel_details.append(KernelDetail(
                 name=kname, duration=dur, category=cat,
-                module_path=path, ts=k.get("ts", 0), phase=node_phase))
+                module_path=path, ts=k.get("ts", 0), phase=node_phase,
+                input_dims=k.get("_input_dims", "")))
 
         # Direct cpu_op stats
         for op in node.cpu_ops:
@@ -347,9 +443,13 @@ class ModuleAggregator:
             cat = _categorize_cpu_op(opname)
             prev_dur, prev_cnt = stats.kernel_breakdown.get(cat, (0.0, 0))
             stats.kernel_breakdown[cat] = (prev_dur + dur, prev_cnt + 1)
+            dims = op.get("args", {}).get("Input Dims", "")
+            if dims:
+                dims = CpuOpShapeIndex._format_dims(dims)
             stats.kernel_details.append(KernelDetail(
                 name=opname, duration=dur, category=cat,
-                module_path=path, ts=op.get("ts", 0), phase=node_phase))
+                module_path=path, ts=op.get("ts", 0), phase=node_phase,
+                input_dims=dims if dims else ""))
 
         # Sort own details by timestamp
         stats.kernel_details.sort(key=lambda d: d.ts)
@@ -528,14 +628,23 @@ class ReportGenerator:
         if phase:
             print(f"  Phase: {phase}")
         print(f"{'='*100}")
-        print(f"  {'#':>4s}  {'Duration (us)':>13s}  {'% wall time':>6s}  {'Category':>15s}  {'Module':30s}  Kernel Name")
-        print(f"  {'-'*4}  {'-'*13}  {'-'*6}  {'-'*15}  {'-'*30}  {'-'*50}")
+        has_dims = any(d.input_dims for d in all_details)
+        if has_dims:
+            print(f"  {'#':>4s}  {'Duration (us)':>13s}  {'% wall time':>6s}  {'Category':>15s}  {'Module':30s}  {'Kernel Name':50s}  Input Dims")
+            print(f"  {'-'*4}  {'-'*13}  {'-'*6}  {'-'*15}  {'-'*30}  {'-'*50}  {'-'*40}")
+        else:
+            print(f"  {'#':>4s}  {'Duration (us)':>13s}  {'% wall time':>6s}  {'Category':>15s}  {'Module':30s}  Kernel Name")
+            print(f"  {'-'*4}  {'-'*13}  {'-'*6}  {'-'*15}  {'-'*30}  {'-'*50}")
 
         for i, d in enumerate(all_details, 1):
             pct = d.duration / wall_time * 100 if wall_time > 0 else 0
             leaf = d.module_path.rsplit("/", 1)[-1] if "/" in d.module_path else d.module_path
             kname = d.name[:80]
-            print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname}")
+            if has_dims:
+                dims = d.input_dims[:60] if d.input_dims else ""
+                print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname:50s}  {dims}")
+            else:
+                print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname}")
 
     def _pick_median_instance(self, matches: List[ModuleStats],
                               mode: str) -> Tuple[ModuleStats, str]:
@@ -706,7 +815,8 @@ class ReportGenerator:
         # --- Kernel Detail sheet: one row per kernel with module path ---
         ws4 = wb.create_sheet(title="Kernel Detail")
         kd_headers = ["#", "Module Path", "Kernel Name", "Category",
-                       "Duration (us)", "% of Layer", "Timestamp (us)", "Phase"]
+                       "Duration (us)", "% of Layer", "Timestamp (us)", "Phase",
+                       "Input Dims"]
         for col, h in enumerate(kd_headers, 1):
             cell = ws4.cell(row=1, column=col, value=h)
             cell.font = header_font
@@ -720,6 +830,7 @@ class ReportGenerator:
         # Set kernel name column width
         ws4.column_dimensions["C"].width = 80
         ws4.column_dimensions["B"].width = 40
+        ws4.column_dimensions["I"].width = 60
 
         # --- Per-module-type detail sheets ---
         # If --detail-module given, use exactly those; otherwise top N by time
@@ -763,7 +874,8 @@ class ReportGenerator:
                               f"Wall time: {wall_time:,.0f} us  |  "
                               f"Overlap: {sum_dur - wall_time:,.0f} us  "
                               f"(% uses wall time)")
-            det_headers = ["#", "Module", "Kernel Name", "Category", "Duration (us)", "% wall time", "Phase"]
+            det_headers = ["#", "Module", "Kernel Name", "Category",
+                          "Duration (us)", "% wall time", "Phase", "Input Dims"]
             for col, h in enumerate(det_headers, 1):
                 cell = ws_det.cell(row=3, column=col, value=h)
                 cell.font = header_font
@@ -780,11 +892,13 @@ class ReportGenerator:
                 ws_det.cell(row=r, column=5, value=round(d.duration, 1))
                 ws_det.cell(row=r, column=6, value=round(pct, 1))
                 ws_det.cell(row=r, column=7, value=d.phase)
+                ws_det.cell(row=r, column=8, value=d.input_dims)
             if detail_truncated:
                 ws_det.cell(row=MAX_ROWS_PER_TAB + 4, column=1,
                             value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
             ws_det.column_dimensions["C"].width = 80
             ws_det.column_dimensions["B"].width = 35
+            ws_det.column_dimensions["H"].width = 60
 
         wb.save(output_path)
         print(f"\nExcel report saved to: {output_path}")
@@ -973,6 +1087,7 @@ class ReportGenerator:
             ws.cell(row=row, column=6, value=round(pct, 1))
             ws.cell(row=row, column=7, value=round(d.ts, 1))
             ws.cell(row=row, column=8, value=d.phase)
+            ws.cell(row=row, column=9, value=d.input_dims)
             row += 1
         return row
 
@@ -1083,6 +1198,7 @@ class TraceModuleAnalyzer:
         # Single-pass categorization: extract everything we need
         kernel_events = []
         runtime_events = []
+        driver_events = []
         cpu_ops = []
         module_events = []  # pre-filtered nn.Module events
         gpu_memcpy = []
@@ -1096,6 +1212,8 @@ class TraceModuleAnalyzer:
                 kernel_events.append(e)
             elif cat == "cuda_runtime":
                 runtime_events.append(e)
+            elif cat == "cuda_driver":
+                driver_events.append(e)
             elif cat == "cpu_op":
                 cpu_ops.append(e)
             elif cat == "gpu_memcpy":
@@ -1120,6 +1238,7 @@ class TraceModuleAnalyzer:
         mode = "full" if kernel_events else "cpu_only"
         print(f"  kernel events: {len(kernel_events):,}")
         print(f"  cuda_runtime events: {len(runtime_events):,}")
+        print(f"  cuda_driver events: {len(driver_events):,}")
         print(f"  cpu_op events: {len(cpu_ops):,}")
         print(f"  nn.Module events: {len(module_events):,}")
         print(f"  gpu_memcpy events: {len(gpu_memcpy):,}")
@@ -1152,15 +1271,22 @@ class TraceModuleAnalyzer:
 
         # Step 3: Correlate compute events → modules
         if mode == "full":
-            print("\nCorrelating kernels to modules via cuda_runtime...")
+            print("\nBuilding cpu_op shape index for Input Dims...")
+            shape_index = CpuOpShapeIndex(cpu_ops, runtime_events, driver_events)
+            print(f"  Indexed {len(shape_index._corr_to_shape):,} correlation→shape mappings")
+
+            print("Correlating kernels to modules via cuda_runtime + cuda_driver...")
             all_gpu_events = kernel_events + gpu_memcpy + gpu_memset
-            correlator = KernelCorrelator(runtime_events, roots)
-            del runtime_events  # free memory
-            matched = correlator.correlate(all_gpu_events, roots)
+            correlator = KernelCorrelator(runtime_events, roots,
+                                          driver_events=driver_events)
+            del runtime_events, driver_events  # free memory
+            matched = correlator.correlate(all_gpu_events, roots,
+                                           shape_index=shape_index)
+            del shape_index  # free memory
             print(f"  Matched {matched:,} / {len(all_gpu_events):,} GPU events to modules")
         else:
             print("\nCorrelating cpu_ops to modules via time containment...")
-            del runtime_events
+            del runtime_events, driver_events
             correlator = CpuOpCorrelator(roots)
             matched = correlator.correlate(cpu_ops, roots)
             print(f"  Matched {matched:,} / {len(cpu_ops):,} cpu_ops to modules")
