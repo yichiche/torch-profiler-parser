@@ -842,7 +842,8 @@ class ReportGenerator:
             sorted_types_flat = sorted(type_agg_flat.items(), key=lambda x: -sum(x[1]))
             top_type_names = {mtype for mtype, _ in sorted_types_flat[:top_n_types]}
         seen_types: Dict[Tuple[str, str], ModuleStats] = {}
-        self._find_median_instance_per_type(stats_list, seen_types, mode)
+        self._find_median_instance_per_type(stats_list, seen_types, mode,
+                                            force_types=top_type_names)
         for (mtype, phase), rep_stats in sorted(seen_types.items()):
             if mtype not in top_type_names:
                 continue
@@ -1093,11 +1094,13 @@ class ReportGenerator:
 
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
                                        seen: Dict[Tuple[str, str], ModuleStats],
-                                       mode: str):
+                                       mode: str,
+                                       force_types: Optional[set] = None):
         """Find median instance of each (module_type, phase) pair.
 
         Groups by (module_type, phase) so that prefill and decode get separate
         representative instances, producing separate detail sheets.
+        force_types: if given, always include these types even if they are leaf modules.
         """
         # First collect all instances per type
         all_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
@@ -1105,7 +1108,8 @@ class ReportGenerator:
         # Pick median for each (type, phase) pair
         for mtype, instances in all_by_type.items():
             if not any(s.children_stats for s in instances):
-                continue  # skip leaf modules
+                if not (force_types and mtype in force_types):
+                    continue
             # Sub-group by phase
             by_phase: Dict[str, List[ModuleStats]] = defaultdict(list)
             for s in instances:
