@@ -17,10 +17,14 @@ Examples:
 
 import argparse
 import ast
+import gzip
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1046,6 +1050,1340 @@ def _walk_tree(node: ModuleTree):
         yield from _walk_tree(child)
 
 
+# ===========================================================================
+# Architecture Diagram v2: Template-based rendering
+# ===========================================================================
+
+ARCH_COLOR_MAP = {
+    "embedding":    "#1e5fa8",
+    "attention":    "#b8860b",
+    "norm":         "#4a5568",
+    "ffn":          "#2d8659",
+    "moe_router":   "#c0392b",
+    "expert_pool":  "#6b21a8",
+    "projection":   "#0e7490",
+    "activation":   "#2d8659",
+    "lm_head":      "#0e7490",
+    "default":      "#374151",
+}
+
+_CATEGORY_PATTERNS = [
+    ("embedding",   re.compile(r"Embed|Embedding|RotaryEmb|VocabParallel", re.IGNORECASE)),
+    ("attention",   re.compile(
+        r"Attention|Attn|MLA|SelfAttn|CrossAttn|MultiHead|FlashAttn", re.IGNORECASE)),
+    ("moe_router",  re.compile(r"Router|Gate(?!Proj)|TopK|MoEGate", re.IGNORECASE)),
+    ("expert_pool", re.compile(
+        r"Expert|MoE(?!Gate)|FusedMoE|MixtralMoE|SharedExpert", re.IGNORECASE)),
+    ("norm",        re.compile(r"Norm|RMSNorm|LayerNorm|BatchNorm|GroupNorm", re.IGNORECASE)),
+    ("ffn",         re.compile(
+        r"MLP|FFN|FeedForward|SiluAndMul|Activation|GatedMLP", re.IGNORECASE)),
+    ("projection",  re.compile(
+        r"Linear|Proj|GateProj|UpProj|DownProj|QKVParallel|RowParallel"
+        r"|ColumnParallel|MergedColumnParallel|QKVParallelLinear", re.IGNORECASE)),
+]
+
+
+def classify_module_category(module_type: str) -> str:
+    for category, pattern in _CATEGORY_PATTERNS:
+        if pattern.search(module_type):
+            return category
+    return "default"
+
+
+def get_category_color(category: str) -> str:
+    return ARCH_COLOR_MAP.get(category, ARCH_COLOR_MAP["default"])
+
+
+# ---------------------------------------------------------------------------
+# Semantic block dataclass for template-based diagrams
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SemanticBlock:
+    """A single visual block in the architecture diagram."""
+    label: str
+    category: str
+    annotation: str = ""
+    children: List["SemanticBlock"] = field(default_factory=list)
+    layout: str = "vertical"       # "vertical" | "parallel" | "expert_grid"
+    residual_after: bool = False
+    width_fraction: float = 1.0    # 0.5 for half-width parallel blocks
+    expert_count: int = 0
+    expert_display: int = 6        # how many E1..En to show
+
+
+@dataclass
+class LayerGroupDef:
+    """A group of repeated layers with a dashed border."""
+    count: int
+    label: str
+    blocks: List[SemanticBlock] = field(default_factory=list)
+
+
+@dataclass
+class ArchTemplate:
+    """Full architecture template for a model."""
+    title: str
+    subtitle: str = ""
+    header_blocks: List[SemanticBlock] = field(default_factory=list)
+    layer_groups: List[LayerGroupDef] = field(default_factory=list)
+    footer_blocks: List[SemanticBlock] = field(default_factory=list)
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# TraceHierarchyExtractor (kept for fallback / raw tree)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ArchNode:
+    """Deduplicated architecture tree node (used by fallback renderer)."""
+    module_type: str
+    category: str
+    color: str
+    count: int = 1
+    annotation: str = ""
+    children: List["ArchNode"] = field(default_factory=list)
+
+
+class TraceHierarchyExtractor:
+    """Load a trace file and build a deduplicated ArchNode tree."""
+
+    def __init__(self, trace_path: str):
+        self.trace_path = trace_path
+
+    def extract(self) -> List[ArchNode]:
+        from trace_module_analyzer import ModuleTreeBuilder, TraceModuleAnalyzer
+
+        data = TraceModuleAnalyzer._load_trace(self.trace_path)
+        events = data.get("traceEvents", [])
+        prefix = "nn.Module: "
+        module_events = [
+            e for e in events
+            if e.get("cat") == "python_function"
+            and str(e.get("name", "")).startswith(prefix)
+            and e.get("dur") is not None
+        ]
+        builder = ModuleTreeBuilder()
+        roots = builder.build_from_module_events(module_events)
+        if not roots:
+            return []
+        best_root = max(roots, key=lambda r: r.end - r.ts)
+        return [self._deduplicate(best_root)]
+
+    def extract_raw_root(self):
+        """Return the raw ModuleNode root (for template matching)."""
+        from trace_module_analyzer import ModuleTreeBuilder, TraceModuleAnalyzer
+
+        data = TraceModuleAnalyzer._load_trace(self.trace_path)
+        events = data.get("traceEvents", [])
+        prefix = "nn.Module: "
+        module_events = [
+            e for e in events
+            if e.get("cat") == "python_function"
+            and str(e.get("name", "")).startswith(prefix)
+            and e.get("dur") is not None
+        ]
+        builder = ModuleTreeBuilder()
+        roots = builder.build_from_module_events(module_events)
+        if not roots:
+            return None
+        return max(roots, key=lambda r: r.end - r.ts)
+
+    def _deduplicate(self, node) -> ArchNode:
+        category = classify_module_category(node.module_type)
+        arch = ArchNode(
+            module_type=node.module_type,
+            category=category,
+            color=get_category_color(category),
+        )
+        if not node.children:
+            return arch
+        groups: List[Tuple[str, List]] = []
+        for child in node.children:
+            if groups and groups[-1][0] == child.module_type:
+                groups[-1][1].append(child)
+            else:
+                groups.append((child.module_type, [child]))
+        for module_type, members in groups:
+            child_arch = self._deduplicate(members[0])
+            child_arch.count = len(members)
+            arch.children.append(child_arch)
+        return arch
+
+
+# ---------------------------------------------------------------------------
+# Template: DeepSeek V2/V3 MoE
+# ---------------------------------------------------------------------------
+
+def _build_deepseek_template(cfg: Dict[str, Any], root_type: str,
+                             raw_root=None) -> ArchTemplate:
+    hs = cfg.get("hidden_size", 0)
+    vs = cfg.get("vocab_size", 0)
+    nh = cfg.get("num_attention_heads", 0)
+    nkv = cfg.get("num_key_value_heads", nh)
+    kv_lora = cfg.get("kv_lora_rank")
+    inter = cfg.get("intermediate_size", 0)
+    moe_inter = cfg.get("moe_intermediate_size", 0)
+    n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+    n_shared = cfg.get("n_shared_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0)
+    first_k = cfg.get("first_k_dense_replace", 0)
+    total_layers = cfg.get("num_hidden_layers", 0)
+    max_pos = cfg.get("max_position_embeddings", 0)
+
+    # When config is missing/empty, derive what we can from the trace tree
+    _trace_child_types = set()
+    if raw_root and hasattr(raw_root, "children"):
+        for child in raw_root.children:
+            _trace_child_types.add(child.module_type)
+            if not total_layers and "DecoderLayer" in child.module_type:
+                total_layers = sum(
+                    1 for c in raw_root.children
+                    if c.module_type == child.module_type
+                )
+            for gc in getattr(child, "children", []):
+                _trace_child_types.add(gc.module_type)
+
+    is_mla = kv_lora is not None and kv_lora > 0
+    if not is_mla and any("MLA" in t for t in _trace_child_types):
+        is_mla = True
+    has_moe_in_trace = any(
+        "MoE" in t or "FusedMoE" in t or "Expert" in t
+        for t in _trace_child_types
+    )
+
+    attn_label = "Multi-head Latent Attention" if is_mla else "Multi-head Attention"
+    attn_ann = f"{nh} heads" if nh else ""
+    if nkv and nkv != nh:
+        attn_ann += f" / {nkv} KV heads"
+
+    model_name = "DeepSeek"
+    archs = cfg.get("architectures", [])
+    if archs:
+        name = archs[0].replace("ForCausalLM", "")
+        if "V3" in name or "v3" in root_type:
+            model_name = "DeepSeek-V3"
+        elif "V2" in name or "v2" in root_type.lower():
+            model_name = "DeepSeek-V2"
+    elif "v3" in root_type.lower():
+        model_name = "DeepSeek-V3"
+    elif "v2" in root_type.lower():
+        model_name = "DeepSeek-V2"
+
+    # Compute parameter estimate
+    params_b = 0
+    if hs and total_layers:
+        attn_params = 4 * hs * hs
+        ffn_params = 3 * hs * inter if inter else 0
+        moe_ffn_params = n_routed * 3 * hs * moe_inter if n_routed and moe_inter else 0
+        shared_ffn_params = n_shared * 3 * hs * moe_inter if n_shared and moe_inter else 0
+        dense_layer_params = attn_params + ffn_params
+        moe_layer_params = attn_params + moe_ffn_params + shared_ffn_params
+        total_params = first_k * dense_layer_params + (total_layers - first_k) * moe_layer_params
+        total_params += vs * hs  # embedding
+        params_b = total_params / 1e9
+
+    active_b = 0
+    if params_b and n_routed and top_k:
+        active_per_expert = 3 * hs * moe_inter if moe_inter else 0
+        moe_active_ffn = top_k * active_per_expert + n_shared * active_per_expert
+        attn_params = 4 * hs * hs
+        dense_ffn = 3 * hs * inter if inter else 0
+        active_per_layer = attn_params + moe_active_ffn
+        dense_per_layer = attn_params + dense_ffn
+        total_active = first_k * dense_per_layer + (total_layers - first_k) * active_per_layer
+        total_active += vs * hs
+        active_b = total_active / 1e9
+
+    context_k = max_pos // 1000 if max_pos else 0
+    subtitle_parts = []
+    if params_b > 0:
+        subtitle_parts.append(f"{params_b:.0f}B total")
+    if active_b > 0:
+        subtitle_parts.append(f"{active_b:.0f}B active")
+    if context_k:
+        subtitle_parts.append(f"{context_k}K context")
+    subtitle = " · ".join(subtitle_parts)
+
+    embed_ann = ""
+    if hs:
+        embed_ann += f"d = {hs:,}"
+    if vs:
+        embed_ann += f" \u00b7 vocab = {vs:,}"
+
+    # Dense layer blocks
+    dense_blocks = [
+        SemanticBlock(label="RMSNorm", category="norm"),
+        SemanticBlock(label=attn_label, category="attention",
+                      annotation=attn_ann, residual_after=True),
+        SemanticBlock(label="RMSNorm", category="norm"),
+        SemanticBlock(label="Dense FFN", category="ffn",
+                      annotation=f"intermediate = {inter:,}" if inter else "",
+                      residual_after=True),
+    ]
+
+    # MoE layer blocks
+    expert_total = n_routed + n_shared
+    router_ann = f"Top-{top_k} of {n_routed} routed" if top_k and n_routed else ""
+    if n_shared:
+        router_ann += f" + {n_shared} shared"
+
+    expert_ffn = SemanticBlock(
+        label="EXPERT FFN (SwiGLU)", category="expert_pool", layout="vertical",
+        children=[
+            SemanticBlock(label="", category="projection", layout="parallel", children=[
+                SemanticBlock(label="Gate Projection", category="projection",
+                              annotation=f"\u2192 {moe_inter:,}" if moe_inter else "",
+                              width_fraction=0.48),
+                SemanticBlock(label="Up Projection", category="projection",
+                              annotation=f"\u2192 {moe_inter:,}" if moe_inter else "",
+                              width_fraction=0.48),
+            ]),
+            SemanticBlock(label="SiLU Activation", category="activation",
+                          annotation="Applied to gate", width_fraction=0.48),
+            SemanticBlock(label="Down Projection", category="projection",
+                          annotation=f"\u2192 {hs:,}" if hs else "",
+                          residual_after=True),
+        ],
+    )
+
+    expert_grid = SemanticBlock(
+        label="", category="expert_pool", layout="expert_grid",
+        expert_count=expert_total, expert_display=6,
+    )
+
+    moe_blocks = [
+        SemanticBlock(label="RMSNorm", category="norm"),
+        SemanticBlock(label=attn_label, category="attention",
+                      annotation=attn_ann, residual_after=True),
+        SemanticBlock(label="RMSNorm", category="norm"),
+        SemanticBlock(label="MoE Router", category="moe_router",
+                      annotation=router_ann),
+        expert_grid,
+        expert_ffn,
+    ]
+
+    layer_groups = []
+    if first_k > 0:
+        layer_groups.append(LayerGroupDef(
+            count=first_k, label=f"\u00d7{first_k} Dense layers",
+            blocks=dense_blocks))
+    moe_count = total_layers - first_k if total_layers else 0
+    if moe_count > 0 and (n_routed or has_moe_in_trace):
+        layer_groups.append(LayerGroupDef(
+            count=moe_count, label=f"\u00d7{moe_count} MoE layers",
+            blocks=moe_blocks))
+    elif moe_count > 0:
+        layer_groups.append(LayerGroupDef(
+            count=moe_count, label=f"\u00d7{moe_count} layers",
+            blocks=dense_blocks))
+    if not layer_groups and total_layers:
+        if has_moe_in_trace:
+            layer_groups.append(LayerGroupDef(
+                count=total_layers, label=f"\u00d7{total_layers} layers",
+                blocks=moe_blocks))
+        else:
+            layer_groups.append(LayerGroupDef(
+                count=total_layers, label=f"\u00d7{total_layers} layers",
+                blocks=dense_blocks))
+
+    # Metadata footer
+    meta = {}
+    meta["Type"] = "MoE" if (n_routed or has_moe_in_trace) else "Dense"
+    if first_k and moe_count:
+        meta["Layers"] = f"{first_k}D+{moe_count}M"
+    elif total_layers:
+        meta["Layers"] = str(total_layers)
+    meta["Attention"] = "MLA" if is_mla else "MHA"
+    if context_k:
+        meta["Context"] = f"{context_k}K"
+    if n_routed:
+        meta["Experts"] = f"{top_k}/{expert_total}"
+    elif has_moe_in_trace:
+        meta["Experts"] = "MoE"
+
+    return ArchTemplate(
+        title=model_name,
+        subtitle=subtitle,
+        header_blocks=[
+            SemanticBlock(label="Token Embedding", category="embedding",
+                          annotation=embed_ann),
+        ],
+        layer_groups=layer_groups,
+        footer_blocks=[
+            SemanticBlock(label="RMSNorm", category="norm"),
+            SemanticBlock(label="Output Head (LM Head)", category="lm_head",
+                          annotation=f"vocab = {vs:,}" if vs else ""),
+        ],
+        metadata=meta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Template: Wan 2.2 Diffusion Transformer
+# ---------------------------------------------------------------------------
+
+def _build_wan_template(cfg: Dict[str, Any], root_type: str,
+                        raw_root=None) -> ArchTemplate:
+    layer_blocks = [
+        SemanticBlock(label="Self-Attention", category="attention",
+                      annotation="QKV + output projection"),
+        SemanticBlock(label="Cross-Attention", category="attention",
+                      annotation="Text-conditioned"),
+        SemanticBlock(label="MLP", category="ffn",
+                      annotation="Feed-forward"),
+    ]
+
+    num_blocks = cfg.get("num_hidden_layers", 0)
+    if not num_blocks and raw_root and hasattr(raw_root, "children"):
+        num_blocks = sum(
+            1 for c in raw_root.children
+            if "TransformerBlock" in c.module_type or "Block" in c.module_type
+        )
+    if not num_blocks:
+        num_blocks = 40
+
+    return ArchTemplate(
+        title="Wan 2.2 Transformer",
+        subtitle="Video Diffusion Model",
+        header_blocks=[
+            SemanticBlock(label="Patch Embedding", category="embedding",
+                          annotation="3D patch tokenization"),
+            SemanticBlock(label="Time + Text + Image Embedding", category="embedding",
+                          annotation="Conditioning signals"),
+        ],
+        layer_groups=[
+            LayerGroupDef(
+                count=num_blocks,
+                label=f"\u00d7{num_blocks} WanTransformerBlock",
+                blocks=layer_blocks,
+            ),
+        ],
+        footer_blocks=[
+            SemanticBlock(label="LayerNorm", category="norm"),
+            SemanticBlock(label="Output Projection", category="projection"),
+        ],
+        metadata={
+            "Type": "DiT",
+            "Blocks": str(num_blocks),
+            "Conditioning": "Text + Time",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Template matcher
+# ---------------------------------------------------------------------------
+
+def match_template(root_type: str, cfg: Optional[Dict[str, Any]] = None,
+                   raw_root=None) -> Optional[ArchTemplate]:
+    """Auto-detect model type from trace root and build the appropriate template."""
+    rt = root_type.lower()
+    if cfg is None:
+        cfg = {}
+
+    if "deepseek" in rt:
+        return _build_deepseek_template(cfg, root_type, raw_root=raw_root)
+    if "wantransformer" in rt:
+        return _build_wan_template(cfg, root_type, raw_root=raw_root)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ArchDiagramRenderer v2
+# ---------------------------------------------------------------------------
+
+class ArchDiagramRenderer:
+    """Render an ArchTemplate as a dark-themed matplotlib block diagram."""
+
+    BG_COLOR = "#1a1a2e"
+    TEXT_COLOR = "#e0e0e0"
+    ARROW_COLOR = "#666666"
+    GROUP_BORDER_COLOR = "#555555"
+    RESIDUAL_COLOR = "#aaaaaa"
+    RESIDUAL_LINE_COLOR = "#555555"
+
+    BLOCK_WIDTH = 4.2
+    BLOCK_HEIGHT = 0.55
+    BLOCK_GAP = 0.22
+    GROUP_PAD_X = 0.35
+    GROUP_PAD_TOP = 0.45
+    GROUP_PAD_BOTTOM = 0.20
+    ANNOTATION_FONT_SIZE = 6.0
+    LABEL_FONT_SIZE = 7.5
+    GROUP_LABEL_FONT_SIZE = 7.0
+    TITLE_FONT_SIZE = 11
+    SUBTITLE_FONT_SIZE = 7
+    FOOTER_FONT_SIZE = 7.5
+
+    def __init__(self):
+        self._y = 0.0
+
+    def render_template_to_png(self, template: ArchTemplate, output_path: str,
+                               dpi: int = 200):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+
+        self._y = 0.0
+        items = self._layout_template(template)
+        total_height = abs(self._y) + 2.0
+        fig_width = self.BLOCK_WIDTH + 2 * self.GROUP_PAD_X + 1.6
+        fig, ax = plt.subplots(figsize=(fig_width, max(total_height, 5)))
+        fig.patch.set_facecolor(self.BG_COLOR)
+        ax.set_facecolor(self.BG_COLOR)
+        ax.set_xlim(-fig_width / 2, fig_width / 2)
+        ax.set_ylim(self._y - 0.8, 1.2)
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+        # Title + subtitle
+        ax.text(0, 0.85, template.title, ha="center", va="center",
+                fontsize=self.TITLE_FONT_SIZE, fontweight="bold",
+                color=self.TEXT_COLOR)
+        if template.subtitle:
+            ax.text(0, 0.55, template.subtitle, ha="center", va="center",
+                    fontsize=self.SUBTITLE_FONT_SIZE, color="#999999")
+
+        for item in items:
+            self._dispatch_draw(ax, item, mpatches)
+
+        plt.tight_layout(pad=0.2)
+        fig.savefig(output_path, dpi=dpi, facecolor=fig.get_facecolor(),
+                    bbox_inches="tight", pad_inches=0.15)
+        plt.close(fig)
+
+    # --- Layout engine ---
+
+    def _layout_template(self, template: ArchTemplate) -> List[Dict]:
+        items: List[Dict] = []
+        self._y = 0.2
+
+        for block in template.header_blocks:
+            self._layout_block(block, items)
+            self._emit_arrow(items)
+
+        for group in template.layer_groups:
+            self._layout_group(group, items)
+            self._emit_arrow(items)
+
+        for i, block in enumerate(template.footer_blocks):
+            self._layout_block(block, items)
+            if i < len(template.footer_blocks) - 1:
+                self._emit_arrow(items)
+
+        if template.metadata:
+            self._y -= self.BLOCK_GAP * 0.5
+            items.append({
+                "kind": "metadata_footer",
+                "y": self._y - 0.4,
+                "data": template.metadata,
+            })
+            self._y -= 0.6
+
+        return items
+
+    def _layout_block(self, block: SemanticBlock, items: List[Dict],
+                      width_override: float = 0.0, x_offset: float = 0.0):
+        bw = width_override or (self.BLOCK_WIDTH * block.width_fraction)
+        bh = self.BLOCK_HEIGHT
+        if block.annotation:
+            bh += 0.12 * (block.annotation.count("\n") + 1)
+
+        if block.layout == "parallel" and block.children:
+            self._layout_parallel(block, items)
+            return
+
+        if block.layout == "expert_grid":
+            if block.expert_count > 0:
+                self._layout_expert_grid(block, items)
+            return
+
+        # Blocks with vertical children render as a section header, not a filled box
+        is_section_header = block.children and block.layout == "vertical"
+
+        if is_section_header:
+            if block.label:
+                items.append({
+                    "kind": "section_label",
+                    "x": x_offset,
+                    "y": self._y - 0.15,
+                    "label": block.label,
+                })
+                self._y -= 0.30
+            for i, child in enumerate(block.children):
+                if child.layout == "parallel":
+                    self._layout_parallel(child, items)
+                else:
+                    self._layout_block(child, items)
+                if i < len(block.children) - 1:
+                    self._emit_arrow(items)
+            return
+
+        block_y = self._y - bh
+        items.append({
+            "kind": "block",
+            "x": x_offset - bw / 2, "y": block_y,
+            "w": bw, "h": bh,
+            "label": block.label,
+            "color": get_category_color(block.category),
+            "annotation": block.annotation,
+        })
+        self._y = block_y - self.BLOCK_GAP
+
+        if block.residual_after:
+            res_y = block_y + bh / 2
+            items.append({
+                "kind": "residual",
+                "x": bw / 2 + 0.25 + x_offset,
+                "y": res_y,
+                "y_top": block_y + bh + self.BLOCK_GAP + self.BLOCK_HEIGHT,
+                "y_bottom": block_y,
+            })
+
+    def _layout_parallel(self, block: SemanticBlock, items: List[Dict]):
+        """Layout children side-by-side."""
+        n = len(block.children)
+        if n == 0:
+            return
+        gap = 0.15
+        total_w = self.BLOCK_WIDTH
+        child_w = (total_w - gap * (n - 1)) / n
+
+        saved_y = self._y
+        max_drop = 0.0
+
+        for i, child in enumerate(block.children):
+            cx = -total_w / 2 + child_w / 2 + i * (child_w + gap)
+            bh = self.BLOCK_HEIGHT
+            if child.annotation:
+                bh += 0.12
+            block_y = saved_y - bh
+            items.append({
+                "kind": "block",
+                "x": cx - child_w / 2, "y": block_y,
+                "w": child_w, "h": bh,
+                "label": child.label,
+                "color": get_category_color(child.category),
+                "annotation": child.annotation,
+            })
+            drop = bh + self.BLOCK_GAP
+            if drop > max_drop:
+                max_drop = drop
+
+        self._y = saved_y - max_drop
+
+    def _layout_expert_grid(self, block: SemanticBlock, items: List[Dict]):
+        """Layout expert grid: E1, E2, ... En, ..., +total."""
+        items.append({
+            "kind": "expert_grid",
+            "y": self._y,
+            "expert_count": block.expert_count,
+            "expert_display": block.expert_display,
+        })
+        self._y -= 0.55
+
+    def _layout_group(self, group: LayerGroupDef, items: List[Dict]):
+        group_start_y = self._y
+        items.append({"kind": "group_start", "y": self._y, "label": group.label})
+        self._y -= self.GROUP_PAD_TOP
+
+        for i, block in enumerate(group.blocks):
+            self._layout_block(block, items)
+            if i < len(group.blocks) - 1:
+                self._emit_arrow(items)
+
+        self._y -= self.GROUP_PAD_BOTTOM
+        items.append({
+            "kind": "group_end",
+            "y_start": group_start_y,
+            "y_end": self._y,
+            "label": group.label,
+            "cx": 0.0,
+            "width": self.BLOCK_WIDTH + 2 * self.GROUP_PAD_X,
+        })
+        self._y -= self.BLOCK_GAP * 0.3
+
+    def _emit_arrow(self, items: List[Dict]):
+        items.append({
+            "kind": "arrow",
+            "x": 0.0,
+            "y_start": self._y + self.BLOCK_GAP,
+            "y_end": self._y + 0.04,
+        })
+
+    # --- Drawing primitives ---
+
+    def _dispatch_draw(self, ax, item: Dict, mp):
+        kind = item["kind"]
+        if kind == "block":
+            self._draw_block(ax, item, mp)
+        elif kind == "arrow":
+            self._draw_arrow(ax, item, mp)
+        elif kind == "group_end":
+            self._draw_group_border(ax, item, mp)
+        elif kind == "residual":
+            self._draw_residual(ax, item, mp)
+        elif kind == "expert_grid":
+            self._draw_expert_grid(ax, item, mp)
+        elif kind == "metadata_footer":
+            self._draw_metadata_footer(ax, item)
+        elif kind == "section_label":
+            self._draw_section_label(ax, item)
+
+    def _draw_block(self, ax, item: Dict, mp):
+        x, y, w, h = item["x"], item["y"], item["w"], item["h"]
+        color = item["color"]
+        label = item["label"]
+        annotation = item.get("annotation", "")
+
+        box = mp.FancyBboxPatch(
+            (x, y), w, h,
+            boxstyle=mp.BoxStyle.Round(pad=0.04, rounding_size=0.08),
+            facecolor=color, edgecolor="#ffffff20", linewidth=0.7,
+        )
+        ax.add_patch(box)
+
+        if label:
+            text_y = y + h * 0.62 if annotation else y + h / 2
+            ax.text(x + w / 2, text_y, label,
+                    ha="center", va="center",
+                    fontsize=self.LABEL_FONT_SIZE, fontweight="bold",
+                    color=self.TEXT_COLOR)
+
+        if annotation:
+            ax.text(x + w / 2, y + h * 0.25, annotation,
+                    ha="center", va="center",
+                    fontsize=self.ANNOTATION_FONT_SIZE,
+                    color="#bbbbbb", style="italic")
+
+    def _draw_arrow(self, ax, item: Dict, mp):
+        arrow = mp.FancyArrowPatch(
+            (item["x"], item["y_start"]), (item["x"], item["y_end"]),
+            arrowstyle="-|>", mutation_scale=7,
+            color=self.ARROW_COLOR, linewidth=0.8,
+        )
+        ax.add_patch(arrow)
+
+    def _draw_group_border(self, ax, item: Dict, mp):
+        cx, w = item["cx"], item["width"]
+        y_start, y_end = item["y_start"], item["y_end"]
+        label = item["label"]
+
+        rect = mp.FancyBboxPatch(
+            (cx - w / 2, y_end), w, y_start - y_end,
+            boxstyle=mp.BoxStyle.Round(pad=0.04, rounding_size=0.12),
+            facecolor="none", edgecolor=self.GROUP_BORDER_COLOR,
+            linewidth=1.0, linestyle="--",
+        )
+        ax.add_patch(rect)
+        ax.text(cx + w / 2 - 0.05, y_start - 0.05, label,
+                ha="right", va="top",
+                fontsize=self.GROUP_LABEL_FONT_SIZE,
+                color="#888888", fontstyle="italic")
+
+    def _draw_residual(self, ax, item: Dict, mp):
+        x, y = item["x"], item["y"]
+        circle = mp.Circle(
+            (x, y), 0.10,
+            facecolor=self.BG_COLOR, edgecolor=self.RESIDUAL_COLOR,
+            linewidth=0.8,
+        )
+        ax.add_patch(circle)
+        ax.text(x, y, "+", ha="center", va="center",
+                fontsize=7, fontweight="bold", color=self.RESIDUAL_COLOR)
+
+        y_top = item.get("y_top", y + 0.5)
+        y_bottom = item.get("y_bottom", y - 0.1)
+        bypass_x = x + 0.15
+        ax.plot([x, bypass_x, bypass_x, x + 0.10],
+                [y_top - 0.05, y_top - 0.05, y, y],
+                color="#777777", linewidth=1.0,
+                linestyle=":", clip_on=False)
+
+    def _draw_expert_grid(self, ax, item: Dict, mp):
+        y = item["y"]
+        n_display = item["expert_display"]
+        total = item["expert_count"]
+
+        grid_w = self.BLOCK_WIDTH * 0.85
+        cell_size = 0.28
+        gap = 0.06
+        cells_w = n_display * cell_size + (n_display - 1) * gap
+        start_x = -cells_w / 2
+
+        border_pad = 0.12
+        border = mp.FancyBboxPatch(
+            (-grid_w / 2, y - cell_size - border_pad),
+            grid_w, cell_size + 2 * border_pad,
+            boxstyle=mp.BoxStyle.Round(pad=0.03, rounding_size=0.06),
+            facecolor="#6b21a815", edgecolor="#6b21a8",
+            linewidth=0.8, linestyle="--",
+        )
+        ax.add_patch(border)
+
+        for i in range(n_display):
+            cx = start_x + i * (cell_size + gap)
+            cell = mp.FancyBboxPatch(
+                (cx, y - cell_size), cell_size, cell_size,
+                boxstyle=mp.BoxStyle.Round(pad=0.02, rounding_size=0.04),
+                facecolor="#6b21a8", edgecolor="#ffffff30", linewidth=0.5,
+            )
+            ax.add_patch(cell)
+            ax.text(cx + cell_size / 2, y - cell_size / 2, f"E{i + 1}",
+                    ha="center", va="center",
+                    fontsize=5.5, fontweight="bold", color=self.TEXT_COLOR)
+
+        dots_x = start_x + n_display * (cell_size + gap)
+        ax.text(dots_x, y - cell_size / 2, "\u2026",
+                ha="center", va="center",
+                fontsize=8, color="#999999")
+
+        plus_x = dots_x + gap + cell_size * 0.6
+        plus_cell = mp.FancyBboxPatch(
+            (plus_x - cell_size * 0.4, y - cell_size),
+            cell_size * 0.8, cell_size,
+            boxstyle=mp.BoxStyle.Round(pad=0.02, rounding_size=0.04),
+            facecolor="#4a5568", edgecolor="#ffffff30", linewidth=0.5,
+        )
+        ax.add_patch(plus_cell)
+        ax.text(plus_x, y - cell_size / 2, f"+{total}",
+                ha="center", va="center",
+                fontsize=5, fontweight="bold", color=self.TEXT_COLOR)
+
+    def _draw_metadata_footer(self, ax, item: Dict):
+        y = item["y"]
+        data = item["data"]
+        n = len(data)
+        if n == 0:
+            return
+        total_w = self.BLOCK_WIDTH + 0.4
+        cell_w = total_w / n
+        start_x = -total_w / 2
+
+        for i, (key, val) in enumerate(data.items()):
+            cx = start_x + i * cell_w + cell_w / 2
+            ax.text(cx, y + 0.15, key, ha="center", va="center",
+                    fontsize=5.5, color="#888888")
+            ax.text(cx, y - 0.05, val, ha="center", va="center",
+                    fontsize=self.FOOTER_FONT_SIZE, fontweight="bold",
+                    color=self.TEXT_COLOR)
+
+    def _draw_section_label(self, ax, item: Dict):
+        ax.text(item["x"], item["y"], item["label"],
+                ha="center", va="center",
+                fontsize=self.LABEL_FONT_SIZE - 0.5,
+                fontweight="bold", color="#999999",
+                fontstyle="italic")
+
+    # --- Fallback: render raw ArchNode tree (for unknown models) ---
+
+    def render_fallback_to_png(self, roots: List[ArchNode], output_path: str,
+                               title: str = "Model Architecture", dpi: int = 200):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+
+        self._y = 0.2
+        items: List[Dict] = []
+        for root in roots:
+            self._layout_archnode(root, items, depth=0)
+
+        total_height = abs(self._y) + 1.5
+        fig_width = self.BLOCK_WIDTH + 2 * self.GROUP_PAD_X + 1.6
+        fig, ax = plt.subplots(figsize=(fig_width, max(total_height, 4)))
+        fig.patch.set_facecolor(self.BG_COLOR)
+        ax.set_facecolor(self.BG_COLOR)
+        ax.set_xlim(-fig_width / 2, fig_width / 2)
+        ax.set_ylim(self._y - 0.5, 1.0)
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.text(0, 0.7, title, ha="center", va="center",
+                fontsize=self.TITLE_FONT_SIZE, fontweight="bold",
+                color=self.TEXT_COLOR)
+
+        for item in items:
+            self._dispatch_draw(ax, item, mpatches)
+
+        plt.tight_layout(pad=0.2)
+        fig.savefig(output_path, dpi=dpi, facecolor=fig.get_facecolor(),
+                    bbox_inches="tight", pad_inches=0.15)
+        plt.close(fig)
+
+    def _layout_archnode(self, node: ArchNode, items: List[Dict], depth: int):
+        bw = self.BLOCK_WIDTH
+        bh = self.BLOCK_HEIGHT
+        if node.annotation:
+            bh += 0.12
+
+        is_group = node.count > 1 and node.children
+        if is_group:
+            label = f"\u00d7{node.count} {node.module_type}"
+            group_start_y = self._y
+            items.append({"kind": "group_start", "y": self._y, "label": label})
+            self._y -= self.GROUP_PAD_TOP
+            for i, child in enumerate(node.children):
+                self._layout_archnode(child, items, depth + 1)
+                if i < len(node.children) - 1:
+                    self._emit_arrow(items)
+            self._y -= self.GROUP_PAD_BOTTOM
+            items.append({
+                "kind": "group_end",
+                "y_start": group_start_y, "y_end": self._y,
+                "label": label, "cx": 0.0,
+                "width": bw + 2 * self.GROUP_PAD_X,
+            })
+            self._y -= self.BLOCK_GAP
+        else:
+            display = node.module_type
+            if node.count > 1:
+                display = f"{node.module_type} (\u00d7{node.count})"
+            block_y = self._y - bh
+            items.append({
+                "kind": "block",
+                "x": -bw / 2, "y": block_y,
+                "w": bw, "h": bh,
+                "label": display,
+                "color": node.color,
+                "annotation": node.annotation,
+            })
+            self._y = block_y - self.BLOCK_GAP
+            if node.children:
+                self._emit_arrow(items)
+                for i, child in enumerate(node.children):
+                    self._layout_archnode(child, items, depth + 1)
+                    if i < len(node.children) - 1:
+                        self._emit_arrow(items)
+
+
+# ---------------------------------------------------------------------------
+# arch_diagram_main — pipeline entry point
+# ---------------------------------------------------------------------------
+
+def template_to_text(template: ArchTemplate) -> str:
+    """Render an ArchTemplate as a human-readable text diagram."""
+    W = 62
+    IW = W - 4
+
+    lines: List[str] = []
+
+    def _hbar(char="═"):
+        return char * W
+
+    def _box(label: str, annotation: str = "", prefix: str = "  "):
+        iw = W - len(prefix) - 2
+        lines.append(f"{prefix}┌{'─' * iw}┐")
+        lines.append(f"{prefix}│ {label:<{iw - 2}} │")
+        if annotation:
+            lines.append(f"{prefix}│   {annotation:<{iw - 4}} │")
+        lines.append(f"{prefix}└{'─' * iw}┘")
+
+    def _arrow(prefix: str = "  ", mid: int = IW // 2 + 2):
+        pad = " " * (mid - 1)
+        lines.append(f"{prefix}{pad}│")
+        lines.append(f"{prefix}{pad}▼")
+
+    def _residual(prefix: str = "  ", mid: int = IW // 2 + 2):
+        pad = " " * (mid - 1)
+        lines.append(f"{prefix}{pad}│")
+        lines.append(f"{prefix}{pad[:-1]}⊕")
+        lines.append(f"{prefix}{pad}│")
+
+    def _gbox(label: str, annotation: str = ""):
+        """Block inside a group (wrapped with ║ ... ║)."""
+        iw = IW - 4
+        lines.append(f"  ║  ┌{'─' * iw}┐║")
+        lines.append(f"  ║  │ {label:<{iw - 2}} │║")
+        if annotation:
+            lines.append(f"  ║  │   {annotation:<{iw - 4}} │║")
+        lines.append(f"  ║  └{'─' * iw}┘║")
+
+    def _garrow():
+        mid = IW // 2
+        pad = " " * (mid - 1)
+        lines.append(f"  ║{pad}│{' ' * (IW - mid)}║")
+        lines.append(f"  ║{pad}▼{' ' * (IW - mid)}║")
+
+    def _gresidual():
+        mid = IW // 2
+        pad = " " * (mid - 1)
+        lines.append(f"  ║{pad}│{' ' * (IW - mid)}║")
+        lines.append(f"  ║{' ' * (mid - 2)}⊕{' ' * (IW - mid + 1)}║")
+
+    def _gblank():
+        lines.append(f"  ║{' ' * IW}║")
+
+    def _expert_grid_g(block: SemanticBlock):
+        if not block.expert_count:
+            return
+        n_show = min(block.expert_display, 6)
+        cells = [f"  {f'E{i+1}':^4s}  " for i in range(n_show)]
+        cells.append(f" {'···':^3s} ")
+        cells.append(f" {'×' + str(block.expert_count):^5s} ")
+        inner = "│".join(cells)
+        top_sep = "┬".join("─" * len(c) for c in cells)
+        bot_sep = "┴".join("─" * len(c) for c in cells)
+        lines.append(f"  ║  ┌{top_sep}┐ ║")
+        lines.append(f"  ║  │{inner}│ ║")
+        lines.append(f"  ║  └{bot_sep}┘ ║")
+
+    def _parallel_g(block: SemanticBlock):
+        children = block.children
+        n = len(children)
+        col_w = 26
+        row_top = []
+        row_lbl = []
+        row_ann = []
+        row_bot = []
+        for c in children:
+            row_top.append(f"┌{'─' * (col_w - 2)}┐")
+            row_lbl.append(f"│ {c.label:<{col_w - 4}} │")
+            if c.annotation:
+                row_ann.append(f"│   {c.annotation:<{col_w - 6}} │")
+            else:
+                row_ann.append(None)
+            row_bot.append(f"└{'─' * (col_w - 2)}┘")
+        lines.append(f"  ║  {' '.join(row_top)}   ║")
+        lines.append(f"  ║  {' '.join(row_lbl)}   ║")
+        if any(a is not None for a in row_ann):
+            ann_line = " ".join(a if a else f"│{' ' * (col_w - 2)}│" for a in row_ann)
+            lines.append(f"  ║  {ann_line}   ║")
+        lines.append(f"  ║  {' '.join(row_bot)}   ║")
+
+    def _swiglu_flow_g(block: SemanticBlock):
+        """Render the SwiGLU expert FFN with proper parallel-merge flow."""
+        children = block.children
+        if len(children) < 3:
+            _glabel(block.label)
+            for i, c in enumerate(children):
+                _dump_group_block(c)
+                if i < len(children) - 1:
+                    _garrow()
+            return
+
+        parallel_block = children[0]
+        activation_block = children[1]
+        down_block = children[2]
+
+        gate_child = parallel_block.children[0] if parallel_block.children else None
+        up_child = parallel_block.children[1] if len(parallel_block.children) > 1 else None
+
+        col_w = 26
+        g_label = gate_child.label if gate_child else "Gate"
+        g_ann = gate_child.annotation if gate_child else ""
+        u_label = up_child.label if up_child else "Up"
+        u_ann = up_child.annotation if up_child else ""
+
+        _glabel(block.label)
+        _garrow()
+
+        lines.append(f"  ║  ┌{'─' * (col_w - 2)}┐ ┌{'─' * (col_w - 2)}┐   ║")
+        lines.append(f"  ║  │ {g_label:<{col_w - 4}} │ │ {u_label:<{col_w - 4}} │   ║")
+        if g_ann or u_ann:
+            ga = f"│   {g_ann:<{col_w - 6}} │" if g_ann else f"│{' ' * (col_w - 2)}│"
+            ua = f"│   {u_ann:<{col_w - 6}} │" if u_ann else f"│{' ' * (col_w - 2)}│"
+            lines.append(f"  ║  {ga} {ua}   ║")
+        lines.append(f"  ║  └{'─' * (col_w - 2)}┘ └{'─' * (col_w - 2)}┘   ║")
+
+        lines.append(f"  ║           │                          │                   ║")
+        lines.append(f"  ║           ▼                          │                   ║")
+
+        a_label = activation_block.label
+        a_ann = activation_block.annotation or ""
+        lines.append(f"  ║  ┌{'─' * (col_w - 2)}┐          │                   ║")
+        lines.append(f"  ║  │ {a_label:<{col_w - 4}} │          │                   ║")
+        if a_ann:
+            lines.append(f"  ║  │   {a_ann:<{col_w - 6}} │          │                   ║")
+        lines.append(f"  ║  └{'─' * (col_w - 2)}┘          │                   ║")
+
+        lines.append(f"  ║           │                          │                   ║")
+        lines.append(f"  ║           └──────────⊗───────────────┘                  ║")
+        lines.append(f"  ║                      │                                   ║")
+        _garrow()
+
+        _gbox_inner(down_block.label, down_block.annotation)
+        if down_block.residual_after:
+            _gresidual()
+
+    def _gbox_inner(label: str, annotation: str = ""):
+        iw = IW - 4
+        lines.append(f"  ║  ┌{'─' * iw}┐║")
+        lines.append(f"  ║  │ {label:<{iw - 2}} │║")
+        if annotation:
+            lines.append(f"  ║  │   {annotation:<{iw - 4}} │║")
+        lines.append(f"  ║  └{'─' * iw}┘║")
+
+    def _glabel(text: str):
+        mid = IW // 2
+        label_str = f"── {text} ──"
+        pad_l = mid - len(label_str) // 2
+        pad_r = IW - pad_l - len(label_str)
+        lines.append(f"  ║{' ' * pad_l}{label_str}{' ' * pad_r}║")
+
+    def _dump_group_block(block: SemanticBlock):
+        if block.layout == "expert_grid":
+            _expert_grid_g(block)
+        elif block.layout == "parallel" and block.children:
+            _parallel_g(block)
+        elif block.children and block.layout == "vertical":
+            _swiglu_flow_g(block)
+        else:
+            _gbox(block.label, block.annotation)
+            if block.residual_after:
+                _gresidual()
+
+    # --- Title ---
+    lines.append(_hbar())
+    lines.append(f"  {template.title}")
+    if template.subtitle:
+        lines.append(f"  {template.subtitle}")
+    lines.append(_hbar())
+    lines.append("")
+
+    # --- Header blocks ---
+    for block in template.header_blocks:
+        _box(block.label, block.annotation)
+        _arrow()
+
+    # --- Layer groups ---
+    for group in template.layer_groups:
+        lines.append(f"  ╔{'═' * IW}╗")
+        lines.append(f"  ║ {group.label:<{IW - 2}} ║")
+        lines.append(f"  ╟{'─' * IW}╢")
+        _gblank()
+        for i, block in enumerate(group.blocks):
+            _dump_group_block(block)
+            if i < len(group.blocks) - 1:
+                if not block.residual_after:
+                    _garrow()
+                else:
+                    _garrow()
+        _gblank()
+        lines.append(f"  ╚{'═' * IW}╝")
+        _arrow()
+
+    # --- Footer blocks ---
+    for i, block in enumerate(template.footer_blocks):
+        _box(block.label, block.annotation)
+        if i < len(template.footer_blocks) - 1:
+            _arrow()
+
+    # --- Metadata ---
+    if template.metadata:
+        lines.append("")
+        lines.append(_hbar("─"))
+        meta_parts = [f"{k}: {v}" for k, v in template.metadata.items()]
+        lines.append("  " + " │ ".join(meta_parts))
+        lines.append(_hbar("─"))
+
+    return "\n".join(lines)
+
+
+def template_to_text_simplified(template: ArchTemplate) -> str:
+    """Render an ArchTemplate as a condensed text diagram.
+
+    Layer groups are collapsed into single summary boxes instead of
+    expanding all internal blocks (RMSNorm, Attention, MoE, etc.).
+    """
+    W = 62
+    IW = W - 4
+
+    lines: List[str] = []
+
+    def _hbar(char="═"):
+        return char * W
+
+    def _box(label: str, annotation: str = "", prefix: str = "  "):
+        iw = W - len(prefix) - 2
+        max_content = iw - 2
+        lines.append(f"{prefix}┌{'─' * iw}┐")
+        lines.append(f"{prefix}│ {label[:max_content]:<{max_content}} │")
+        if annotation:
+            ann_text = f"  {annotation}" if not annotation.startswith(" ") else annotation
+            lines.append(f"{prefix}│{ann_text[:iw]:<{iw}}│")
+        lines.append(f"{prefix}└{'─' * iw}┘")
+
+    def _arrow(prefix: str = "  ", mid: int = IW // 2 + 2):
+        pad = " " * (mid - 1)
+        lines.append(f"{prefix}{pad}│")
+        lines.append(f"{prefix}{pad}▼")
+
+    def _summarize_group(group: LayerGroupDef) -> Tuple[str, str]:
+        """Produce (box_label, annotation) for a collapsed layer group."""
+        has_moe = any(
+            b.category == "moe_router" or b.layout == "expert_grid"
+            for b in group.blocks
+        )
+        has_attn = any(b.category == "attention" for b in group.blocks)
+        has_ffn = any(
+            b.category == "ffn" and "Dense" in b.label
+            for b in group.blocks
+        )
+
+        if has_moe:
+            box_label = "MoE Transformer Block"
+        elif has_ffn or has_attn:
+            box_label = "Dense Transformer Block"
+        else:
+            parts = group.label.split(" ", 1)
+            box_label = parts[1] if len(parts) > 1 else group.label
+
+        skip_attn = has_ffn and not has_moe
+
+        summary_parts = [group.label]
+        for block in group.blocks:
+            if block.category == "norm":
+                continue
+            if block.layout == "expert_grid":
+                continue
+            if block.children and block.layout == "vertical":
+                continue
+            if block.category == "attention" and block.label and not skip_attn:
+                if has_moe:
+                    summary_parts.append(block.label)
+                else:
+                    summary_parts.append(block.annotation or block.label)
+            elif block.category == "moe_router" and block.annotation:
+                ann = block.annotation
+                m = re.match(r"Top-(\d+) of (\d+) routed(?: \+ (\d+) shared)?", ann)
+                if m:
+                    top_k, routed, shared = m.group(1), m.group(2), m.group(3)
+                    total = int(routed) + (int(shared) if shared else 0)
+                    ann = f"Top-{top_k}/{total}"
+                summary_parts.append(ann)
+            elif block.category == "ffn" and block.annotation:
+                ann = block.annotation.replace("intermediate = ", "FFN = ")
+                summary_parts.append(ann)
+
+        return box_label, " · ".join(summary_parts)
+
+    # --- Title ---
+    lines.append(_hbar())
+    lines.append(f"  {template.title}")
+    if template.subtitle:
+        lines.append(f"  {template.subtitle}")
+    lines.append(_hbar())
+    lines.append("")
+
+    # --- Header blocks ---
+    for block in template.header_blocks:
+        _box(block.label, block.annotation)
+        _arrow()
+
+    # --- Layer groups (collapsed into single summary boxes) ---
+    for group in template.layer_groups:
+        box_label, annotation = _summarize_group(group)
+        _box(box_label, annotation)
+        _arrow()
+
+    # --- Footer blocks ---
+    for i, block in enumerate(template.footer_blocks):
+        _box(block.label, block.annotation)
+        if i < len(template.footer_blocks) - 1:
+            _arrow()
+
+    # --- Metadata (table format with aligned columns) ---
+    if template.metadata:
+        lines.append("")
+        lines.append(_hbar("─"))
+        keys = list(template.metadata.keys())
+        vals = list(template.metadata.values())
+        col_w = max(10, (W - 2) // len(keys))
+        key_line = "  " + "".join(f"{k:<{col_w}}" for k in keys)
+        val_line = "  " + "".join(f"{v:<{col_w}}" for v in vals)
+        lines.append(key_line)
+        lines.append(val_line)
+        lines.append(_hbar("─"))
+
+    return "\n".join(lines)
+
+
+def generate_arch_diagram(trace_path: str, output_png: str,
+                          config_path: Optional[str] = None,
+                          detailed: bool = False):
+    """Generate architecture diagram PNG from a trace file.
+
+    Returns the path to the generated PNG, or None on failure.
+    Writes a .txt companion file: simplified by default, detailed with detailed=True.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    extractor = TraceHierarchyExtractor(trace_path)
+    raw_root = extractor.extract_raw_root()
+    if raw_root is None:
+        logger.warning("No module hierarchy found in trace for arch diagram.")
+        return None
+
+    root_type = raw_root.module_type
+
+    cfg = {}
+    if config_path and os.path.isfile(config_path):
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+
+    template = match_template(root_type, cfg, raw_root=raw_root)
+    renderer = ArchDiagramRenderer()
+
+    if template:
+        logger.info("Using template for %s", root_type)
+        renderer.render_template_to_png(template, output_png)
+
+        base = output_png.rsplit(".", 1)[0]
+        if detailed:
+            txt_path = base + ".txt"
+            txt = template_to_text(template)
+            with open(txt_path, "w") as f:
+                f.write(txt + "\n")
+            logger.info("Detailed text diagram saved to %s", txt_path)
+        else:
+            txt_path = base + ".txt"
+            txt = template_to_text_simplified(template)
+            with open(txt_path, "w") as f:
+                f.write(txt + "\n")
+            logger.info("Simplified text diagram saved to %s", txt_path)
+    else:
+        logger.info("No template for %s, using fallback renderer", root_type)
+        arch_roots = extractor.extract()
+        title = root_type
+        archs = cfg.get("architectures", [])
+        if archs:
+            title = archs[0]
+        renderer.render_fallback_to_png(arch_roots, output_png, title=title)
+
+    return output_png
+
+
+def arch_diagram_main(trace_path: str,
+                      config_path: Optional[str] = None,
+                      detailed: bool = False):
+    """End-to-end pipeline: trace -> arch_diagram/ folder with PNG + TXT."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+
+    trace_dir = os.path.dirname(os.path.abspath(trace_path))
+    out_dir = os.path.join(trace_dir, "arch_diagram")
+    os.makedirs(out_dir, exist_ok=True)
+
+    png_path = os.path.join(out_dir, "arch_diagram.png")
+
+    print(f"Generating architecture diagram from: {os.path.abspath(trace_path)}")
+    result = generate_arch_diagram(trace_path, png_path, config_path=config_path,
+                                   detailed=detailed)
+    if result is None:
+        print("ERROR: Failed to generate diagram.", file=sys.stderr)
+        sys.exit(1)
+
+    txt_path = os.path.join(out_dir, "arch_diagram.txt")
+    print(f"  PNG: {os.path.abspath(png_path)}")
+    print(f"  TXT: {os.path.abspath(txt_path)}")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1061,9 +2399,15 @@ def main():
   python model_inspector.py deepseek_v2.py --show-line-numbers
   python model_inspector.py deepseek_v2.py --profiler-tree --config config.json
   python model_inspector.py deepseek_v2.py --profiler-tree --config config.json --depth 3
+
+  # Architecture diagram from trace file (outputs to arch_diagram/ next to the trace)
+  python model_inspector.py --trace /path/to/trace.json.gz --arch-diagram
+  python model_inspector.py --trace /path/to/trace.json.gz --arch-diagram --detailed
+  python model_inspector.py --trace /path/to/trace.json.gz --arch-diagram --config config.json
 """,
     )
-    parser.add_argument("model_file", help="Path to model Python source file")
+    parser.add_argument("model_file", nargs="?", default=None,
+                        help="Path to model Python source file (not needed for --arch-diagram)")
     parser.add_argument(
         "--root", metavar="CLASS",
         help="Root class name (default: auto-detect *ForCausalLM)",
@@ -1092,8 +2436,39 @@ def main():
         "--depth", type=int, default=2, metavar="N",
         help="Max depth for --profiler-tree (default: 2)",
     )
+    parser.add_argument(
+        "--trace", metavar="PATH",
+        help="Path to trace file (.json.gz or .json) for --arch-diagram mode",
+    )
+    parser.add_argument(
+        "--arch-diagram", action="store_true",
+        help="Generate architecture block diagram from a trace file",
+    )
+    parser.add_argument(
+        "--detailed", action="store_true",
+        help="Generate detailed text diagram (expanded layer internals). "
+             "Default is simplified (collapsed layer groups).",
+    )
 
     args = parser.parse_args()
+
+    # --- Architecture diagram mode ---
+    if args.arch_diagram:
+        if not args.trace:
+            print("Error: --arch-diagram requires --trace <path>", file=sys.stderr)
+            sys.exit(1)
+        if not os.path.isfile(args.trace):
+            print(f"Error: Trace file not found: {args.trace}", file=sys.stderr)
+            sys.exit(1)
+        arch_diagram_main(args.trace, config_path=args.config,
+                          detailed=args.detailed)
+        return
+
+    # --- Original static analysis mode ---
+    if not args.model_file:
+        print("Error: model_file is required (or use --arch-diagram --trace <path>)",
+              file=sys.stderr)
+        sys.exit(1)
 
     if not os.path.isfile(args.model_file):
         print(f"Error: File not found: {args.model_file}", file=sys.stderr)
