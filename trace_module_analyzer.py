@@ -726,6 +726,60 @@ class PhaseDetector:
 
 
 # ---------------------------------------------------------------------------
+# Model info text generator (from trace module roots, no re-load)
+# ---------------------------------------------------------------------------
+
+def _generate_model_info(roots: List[ModuleNode],
+                         config_path: Optional[str] = None,
+                         png_path: Optional[str] = None
+                         ) -> Tuple[Optional[str], Optional[str]]:
+    """Build architecture diagram text + optional PNG from already-parsed module roots.
+
+    Returns (text, png_path_or_None).  Reuses the trace's module roots so the
+    trace file is never re-loaded.
+    """
+    if not roots:
+        return None, None
+
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        if script_dir not in sys.path:
+            sys.path.insert(0, script_dir)
+        from model_inspector import (match_template, template_to_text,
+                                     ArchDiagramRenderer)
+    except ImportError as e:
+        logger.warning("model_inspector not available: %s", e)
+        return None, None
+
+    best_root = max(roots, key=lambda r: r.end - r.ts)
+    root_type = best_root.module_type
+
+    cfg = {}
+    if config_path and os.path.isfile(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+
+    template = match_template(root_type, cfg, raw_root=best_root)
+    if template is None:
+        logger.info("No arch template for %s, skipping Model Info tab", root_type)
+        return None, None
+
+    text = template_to_text(template)
+
+    actual_png = None
+    if png_path:
+        try:
+            renderer = ArchDiagramRenderer()
+            renderer.render_template_to_png(template, png_path)
+            if os.path.isfile(png_path):
+                actual_png = png_path
+        except Exception as e:
+            logger.warning("Failed to render arch diagram PNG: %s", e)
+
+    return text, actual_png
+
+
+# ---------------------------------------------------------------------------
 # Report generator
 # ---------------------------------------------------------------------------
 
@@ -1017,8 +1071,8 @@ class ReportGenerator:
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
                      output_path: str, top_n_types: int = 3,
                      detail_modules: Optional[List[str]] = None,
-                     trace_path: Optional[str] = None,
-                     config_path: Optional[str] = None):
+                     config_path: Optional[str] = None,
+                     model_info_roots: Optional[List[ModuleNode]] = None):
         """Export analysis to Excel workbook."""
         try:
             import openpyxl
@@ -1061,11 +1115,6 @@ class ReportGenerator:
             total_kernel_count, global_cat_agg,
             header_font, header_fill, title_font,
             top_type_names)
-
-        # Embed architecture diagram below the summary tables
-        if trace_path:
-            self._embed_arch_diagram(ws_summary, summary_last_row,
-                                     trace_path, config_path, output_path)
 
         # --- Overview sheet (hierarchical type tree, with % of Parent + stats) ---
         ws_ov = wb.create_sheet(title="Overview")
@@ -1233,8 +1282,31 @@ class ReportGenerator:
             ws_det.column_dimensions["B"].width = 60
             ws_det.column_dimensions["C"].width = 80
 
+        # --- Model Info tab (architecture text + diagram from trace roots) ---
+        tmp_png = None
+        if model_info_roots:
+            png_dir = os.path.dirname(os.path.abspath(output_path))
+            tmp_png = os.path.join(png_dir, "_arch_diagram_tmp.png")
+            model_info_text, png_result = _generate_model_info(
+                model_info_roots, config_path=config_path,
+                png_path=tmp_png)
+            if model_info_text:
+                self._write_model_info_tab(wb, model_info_text,
+                                           header_font, header_fill,
+                                           png_path=png_result)
+                logger.info("Model Info tab added")
+            else:
+                logger.warning("Could not generate model info "
+                               "(no matching template)")
+
         wb.save(output_path)
         print(f"\nExcel report saved to: {output_path}")
+
+        if tmp_png and os.path.isfile(tmp_png):
+            try:
+                os.unlink(tmp_png)
+            except OSError:
+                pass
 
     @staticmethod
     def _time_stats(times: List[float]) -> Tuple[float, float, float, float, float]:
@@ -1385,41 +1457,38 @@ class ReportGenerator:
 
         return row
 
-    def _embed_arch_diagram(self, ws, after_row: int,
-                            trace_path: str, config_path: Optional[str],
-                            output_path: str):
-        """Generate and embed architecture diagram PNG below the summary tables."""
-        try:
-            import importlib
-            import tempfile
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            if script_dir not in sys.path:
-                sys.path.insert(0, script_dir)
-            from model_inspector import generate_arch_diagram
-            from openpyxl.drawing.image import Image as XlImage
-        except ImportError as e:
-            logger.debug("Skipping arch diagram: %s", e)
-            return
+    def _write_model_info_tab(self, wb, model_info_text: str,
+                              header_font, header_fill,
+                              png_path: Optional[str] = None):
+        """Write a 'Model Info' tab: text on the left, arch diagram PNG on the right."""
+        from openpyxl.styles import Font, Alignment
 
-        png_dir = os.path.dirname(os.path.abspath(output_path))
-        png_path = os.path.join(png_dir, "_arch_diagram_tmp.png")
-        try:
-            result = generate_arch_diagram(trace_path, png_path,
-                                           config_path=config_path)
-            if result and os.path.isfile(png_path):
+        ws = wb.create_sheet(title="Model Info")
+
+        row = 1
+        ws.cell(row=row, column=1, value="Architecture (text)").font = Font(bold=True, size=12)
+        row += 2
+
+        mono_font = Font(name="Courier New", size=9)
+        wrap_align = Alignment(wrap_text=False, vertical="top")
+
+        for line in model_info_text.splitlines():
+            ws.cell(row=row, column=1, value=line).font = mono_font
+            ws.cell(row=row, column=1).alignment = wrap_align
+            row += 1
+
+        ws.column_dimensions["A"].width = 80
+
+        if png_path and os.path.isfile(png_path):
+            try:
+                from openpyxl.drawing.image import Image as XlImage
                 img = XlImage(png_path)
-                anchor_row = after_row + 2
-                img.anchor = f"A{anchor_row}"
+                ws.cell(row=1, column=3,
+                        value="Architecture (diagram)").font = Font(bold=True, size=12)
+                img.anchor = "C3"
                 ws.add_image(img)
-                logger.info("Architecture diagram embedded at row %d", anchor_row)
-        except Exception as e:
-            logger.warning("Failed to generate arch diagram: %s", e)
-        finally:
-            if os.path.isfile(png_path):
-                try:
-                    os.unlink(png_path)
-                except OSError:
-                    pass
+            except Exception as e:
+                logger.warning("Failed to embed arch diagram PNG: %s", e)
 
     def _write_type_row(self, ws, row: int, label: str, depth: int, count: int,
                         times: List[float], parent_time: float,
@@ -1819,7 +1888,8 @@ class TraceModuleAnalyzer:
                  detail_instance: Optional[int] = None,
                  top_n_types: int = 3, show_tree: bool = False,
                  auto_fix_rocm: bool = True,
-                 config_path: Optional[str] = None):
+                 config_path: Optional[str] = None,
+                 model_info: bool = False):
         self.trace_path = trace_path
         self.top_n = top_n
         self.output_path = output_path
@@ -1829,6 +1899,7 @@ class TraceModuleAnalyzer:
         self.show_tree = show_tree
         self.auto_fix_rocm = auto_fix_rocm
         self.config_path = config_path
+        self.model_info = model_info
 
     def run(self):
         # Step 1: Load trace with single-pass categorization
@@ -1989,8 +2060,8 @@ class TraceModuleAnalyzer:
             reporter.export_excel(stats_list, mode, self.output_path,
                                   top_n_types=self.top_n_types,
                                   detail_modules=self.detail_modules,
-                                  trace_path=self.trace_path,
-                                  config_path=self.config_path)
+                                  config_path=self.config_path,
+                                  model_info_roots=roots if self.model_info else None)
 
     def _propagate_phase(self, nodes: List[ModuleNode]):
         """Propagate phase from parent to children if not set."""
@@ -2089,6 +2160,11 @@ Examples:
                         help="Print full module tree to console (verbose)")
     parser.add_argument("--config", metavar="PATH", default=None,
                         help="Path to HuggingFace config.json (enriches architecture diagram)")
+    parser.add_argument("--model-info", action="store_true",
+                        help="Add a 'Model Info' tab to the Excel report with the "
+                             "architecture diagram text (from model_inspector). "
+                             "Uses the trace's module hierarchy — no extra files needed. "
+                             "Combine with --config for richer output.")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2118,6 +2194,7 @@ Examples:
             show_tree=args.show_tree,
             auto_fix_rocm=not args.no_rocm_fix,
             config_path=args.config,
+            model_info=args.model_info,
         )
         analyzer.run()
     except FileNotFoundError as e:
