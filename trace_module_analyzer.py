@@ -884,20 +884,120 @@ class ReportGenerator:
             result.extend(self._collect_all_details(child))
         return result
 
-    def print_type_summary(self, stats_list: List[ModuleStats], mode: str):
-        """Print summary grouped by module type."""
-        type_agg: Dict[str, List[float]] = defaultdict(list)
-        self._collect_by_type(stats_list, type_agg, mode)
+    def print_type_summary(self, stats_list: List[ModuleStats], mode: str,
+                           top_n_types: int = 3,
+                           detail_modules: Optional[List[str]] = None):
+        """Print summary matching the Summary tab: metrics, categories, detail tabs."""
+        grand_total = sum(
+            (s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
+            for s in stats_list)
 
-        print("\n" + "=" * 70)
-        print("  Summary by Module Type")
-        print("=" * 70)
-        print(f"  {'Module Type':<35s} {'Instances':>9s} {'Avg (us)':>12s} {'Total (us)':>14s}")
-        print("  " + "-" * 72)
-        for mtype, times in sorted(type_agg.items(), key=lambda x: -sum(x[1])):
-            total = sum(times)
-            avg = total / len(times) if times else 0
-            print(f"  {mtype:<35s} {len(times):>9d} {avg:>12,.0f} {total:>14,.0f}")
+        # Build wrapper chains and type totals for hierarchy display
+        wrapper_types: set = set()
+        type_children_map: Dict[str, set] = {}
+        top_type_names: set = set()
+        root_chains: Dict[str, List[str]] = {}
+        type_totals: Dict[str, float] = defaultdict(float)
+        if not detail_modules:
+            top_type_names, root_chains, type_totals, wrapper_types, type_children_map = \
+                self._select_detail_types(stats_list, mode, top_n_types)
+
+        # --- Section 1: Kernel Time Summary (with hierarchy) ---
+        print("\n" + "=" * 90)
+        print("  Kernel Time Summary")
+        print("=" * 90)
+        print(f"  {'Metric':<45s} {'Value (us)':>14s} {'%':>7s}  {'Detail Tab'}")
+        print("  " + "-" * 85)
+        print(f"  {'Total Kernel Time':<45s} {grand_total:>14,.1f} {'100.0%':>7s}")
+
+        root_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
+        for s in stats_list:
+            root_by_type[s.module_type].append(s)
+        sorted_root_types = sorted(
+            root_by_type.items(),
+            key=lambda x: -sum(
+                (s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
+                for s in x[1]))
+        for rtype, rlist in sorted_root_types:
+            rtype_total = sum(
+                (s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
+                for s in rlist)
+            pct = rtype_total / grand_total * 100 if grand_total > 0 else 0
+            chain = root_chains.get(rtype, [rtype])
+            print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%")
+            if len(chain) > 1:
+                for i, ctype in enumerate(chain[1:], 1):
+                    is_last = (i == len(chain) - 1)
+                    connector = "└── " if is_last else "├── "
+                    indent = "    " * i
+                    ct = type_totals.get(ctype, 0)
+                    ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
+                    label = f"{indent}{connector}{ctype}"
+                    tab = ctype if ctype in top_type_names else ""
+                    print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
+
+        # --- Section 2: Category breakdown ---
+        global_cat_agg: Dict[str, List] = {}
+        self._collect_global_category_agg(stats_list, global_cat_agg, mode)
+        sorted_cats = sorted(global_cat_agg.items(), key=lambda x: -x[1][0])
+
+        print("\n" + "=" * 90)
+        print("  Kernel Category Breakdown")
+        print("=" * 90)
+        print(f"  {'Category':<20s} {'Count':>8s} {'Total (us)':>14s} {'Avg (us)':>12s} {'%':>8s}")
+        print("  " + "-" * 64)
+        for cat, (dur, cnt) in sorted_cats:
+            pct = dur / grand_total * 100 if grand_total > 0 else 0
+            avg = dur / cnt if cnt > 0 else 0
+            print(f"  {cat:<20s} {cnt:>8,d} {dur:>14,.1f} {avg:>12,.1f} {pct:>7.1f}%")
+        print()
+
+    def _select_detail_types(self, stats_list: List[ModuleStats], mode: str,
+                             top_n_types: int) -> Tuple[set, Dict[str, List[str]],
+                                                         Dict[str, float], set,
+                                                         Dict[str, set]]:
+        """Select detail tab types, prioritizing root chain leaves.
+
+        Returns (top_type_names, root_chains, type_totals,
+                 wrapper_types, type_children_map).
+        """
+        type_agg_flat: Dict[str, List[float]] = defaultdict(list)
+        self._collect_by_type(stats_list, type_agg_flat, mode)
+        sorted_types_flat = sorted(type_agg_flat.items(), key=lambda x: -sum(x[1]))
+        wrapper_types = self._find_wrapper_types(stats_list, mode)
+        type_children_map = self._build_type_children(stats_list)
+        type_totals = {mtype: sum(times) for mtype, times in sorted_types_flat}
+
+        # Build wrapper chains for each root module type
+        root_types = {s.module_type for s in stats_list}
+        root_chains: Dict[str, List[str]] = {}
+        for rtype in root_types:
+            chain = self._trace_wrapper_chain_full(
+                rtype, wrapper_types, type_children_map, stats_list, mode)
+            root_chains[rtype] = chain
+
+        # Step 1: Reserve slots for each root chain's leaf
+        top_type_names: set = set()
+        skip_types: set = set(wrapper_types)
+        for rtype in root_types:
+            chain = root_chains[rtype]
+            leaf = chain[-1]
+            if leaf not in skip_types and leaf not in top_type_names:
+                top_type_names.add(leaf)
+                desc = self._all_descendant_types(leaf, type_children_map)
+                skip_types.update(desc)
+
+        # Step 2: Fill remaining slots from sorted list
+        for mtype, _ in sorted_types_flat:
+            if len(top_type_names) >= top_n_types:
+                break
+            if mtype in skip_types:
+                continue
+            top_type_names.add(mtype)
+            desc = self._all_descendant_types(mtype, type_children_map)
+            skip_types.update(desc)
+
+        return top_type_names, root_chains, type_totals, wrapper_types, type_children_map
 
     def _collect_by_type(self, stats_list: List[ModuleStats],
                          agg: Dict[str, List[float]], mode: str):
@@ -906,9 +1006,19 @@ class ReportGenerator:
             agg[s.module_type].append(time_val)
             self._collect_by_type(s.children_stats, agg, mode)
 
+    def _collect_by_type_total(self, stats_list: List[ModuleStats],
+                               agg: Dict[str, float], mode: str):
+        """Collect total time per module type (summed, not list)."""
+        for s in stats_list:
+            time_val = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+            agg[s.module_type] += time_val
+            self._collect_by_type_total(s.children_stats, agg, mode)
+
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
-                     output_path: str, top_n_types: int = 5,
-                     detail_modules: Optional[List[str]] = None):
+                     output_path: str, top_n_types: int = 3,
+                     detail_modules: Optional[List[str]] = None,
+                     trace_path: Optional[str] = None,
+                     config_path: Optional[str] = None):
         """Export analysis to Excel workbook."""
         try:
             import openpyxl
@@ -936,12 +1046,26 @@ class ReportGenerator:
         global_cat_agg: Dict[str, List] = {}
         self._collect_global_category_agg(stats_list, global_cat_agg, mode)
 
+        # Pre-compute detail tab selection (needed by Summary tab and detail sheets)
+        if detail_modules:
+            top_type_names = set(detail_modules)
+        else:
+            top_type_names, _, _, _, _ = \
+                self._select_detail_types(stats_list, mode, top_n_types)
+
         # --- Summary tab (one-pager overview) ---
         ws_summary = wb.active
         ws_summary.title = "Summary"
-        self._write_summary_tab(ws_summary, stats_list, mode, grand_total,
-                                total_kernel_count, global_cat_agg,
-                                header_font, header_fill, title_font)
+        summary_last_row = self._write_summary_tab(
+            ws_summary, stats_list, mode, grand_total,
+            total_kernel_count, global_cat_agg,
+            header_font, header_fill, title_font,
+            top_type_names)
+
+        # Embed architecture diagram below the summary tables
+        if trace_path:
+            self._embed_arch_diagram(ws_summary, summary_last_row,
+                                     trace_path, config_path, output_path)
 
         # --- Overview sheet (hierarchical type tree, with % of Parent + stats) ---
         ws_ov = wb.create_sheet(title="Overview")
@@ -1016,16 +1140,9 @@ class ReportGenerator:
         ws3.column_dimensions["G"].width = 50
 
         # --- Per-module-type detail sheets ---
-        # If --detail-module given, use exactly those; otherwise top N by time
         type_agg_flat: Dict[str, List[float]] = defaultdict(list)
         self._collect_by_type(stats_list, type_agg_flat, mode)
-        sorted_types_flat = sorted(type_agg_flat.items(), key=lambda x: -sum(x[1]))
-        if detail_modules:
-            top_type_names = set(detail_modules)
-        else:
-            top_type_names = {mtype for mtype, _ in sorted_types_flat[:top_n_types]}
-        # Build rank lookup: module_type -> total time (for ordering tabs)
-        type_total_time = {mtype: sum(times) for mtype, times in sorted_types_flat}
+        type_total_time = {mtype: sum(times) for mtype, times in type_agg_flat.items()}
         seen_types: Dict[Tuple[str, str], ModuleStats] = {}
         self._find_median_instance_per_type(stats_list, seen_types, mode,
                                             force_types=top_type_names)
@@ -1055,7 +1172,7 @@ class ReportGenerator:
             else:
                 wall_time = 0
 
-            # Header rows
+            # Row 1: title
             phase_label = f" [{phase}]" if phase else ""
             ws_det.cell(row=1, column=1,
                         value=f"{rep_stats.name}{phase_label} — {len(all_details)} kernels").font = Font(bold=True, size=12)
@@ -1064,31 +1181,57 @@ class ReportGenerator:
                               f"Wall time: {wall_time:,.0f} us  |  "
                               f"Overlap: {sum_dur - wall_time:,.0f} us  "
                               f"(% uses wall time)")
-            det_headers = ["#", "Module", "Kernel Name", "Category",
-                          "Duration (us)", "% wall time", "Phase", "Input Dims"]
-            for col, h in enumerate(det_headers, 1):
-                cell = ws_det.cell(row=3, column=col, value=h)
+
+            # Category summary table (rows 3+)
+            cat_agg: Dict[str, float] = defaultdict(float)
+            for d in all_details:
+                cat_agg[d.category] += d.duration
+            sorted_cats = sorted(cat_agg.items(), key=lambda x: -x[1])
+            cat_total = sum(cat_agg.values())
+
+            cur_row = 3
+            for lbl, col_idx in [("Category", 1), ("Percentage (%)", 2),
+                                 ("Total Duration (us)", 3)]:
+                cell = ws_det.cell(row=cur_row, column=col_idx, value=lbl)
                 cell.font = header_font
                 cell.fill = header_fill
+            cur_row += 1
+            for cat, dur in sorted_cats:
+                pct_cat = dur / cat_total * 100 if cat_total > 0 else 0
+                ws_det.cell(row=cur_row, column=1, value=cat)
+                ws_det.cell(row=cur_row, column=2, value=f"{pct_cat:.0f}%")
+                ws_det.cell(row=cur_row, column=3, value=round(dur, 1))
+                cur_row += 1
+            ws_det.cell(row=cur_row, column=1, value="Total").font = Font(bold=True)
+            ws_det.cell(row=cur_row, column=2, value="100%").font = Font(bold=True)
+            ws_det.cell(row=cur_row, column=3, value=round(cat_total, 1)).font = Font(bold=True)
+            cur_row += 2  # blank row before kernel list
+
+            # Kernel detail headers
+            det_headers = ["Module", "Input Dims", "Kernel Name",
+                          "Duration (us)", "% of wall time", "Category"]
+            for col, h in enumerate(det_headers, 1):
+                cell = ws_det.cell(row=cur_row, column=col, value=h)
+                cell.font = header_font
+                cell.fill = header_fill
+            cur_row += 1
             detail_truncated = len(all_details) > MAX_ROWS_PER_TAB
             for i, d in enumerate(all_details[:MAX_ROWS_PER_TAB], 1):
-                r = i + 3
                 pct = d.duration / wall_time * 100 if wall_time > 0 else 0
                 leaf = d.module_path.rsplit("/", 1)[-1] if "/" in d.module_path else d.module_path
-                ws_det.cell(row=r, column=1, value=i)
-                ws_det.cell(row=r, column=2, value=leaf)
-                ws_det.cell(row=r, column=3, value=d.name)
-                ws_det.cell(row=r, column=4, value=d.category)
-                ws_det.cell(row=r, column=5, value=round(d.duration, 1))
-                ws_det.cell(row=r, column=6, value=round(pct, 1))
-                ws_det.cell(row=r, column=7, value=d.phase)
-                ws_det.cell(row=r, column=8, value=d.input_dims)
+                ws_det.cell(row=cur_row, column=1, value=leaf)
+                ws_det.cell(row=cur_row, column=2, value=d.input_dims)
+                ws_det.cell(row=cur_row, column=3, value=d.name)
+                ws_det.cell(row=cur_row, column=4, value=round(d.duration, 1))
+                ws_det.cell(row=cur_row, column=5, value=round(pct, 1))
+                ws_det.cell(row=cur_row, column=6, value=d.category)
+                cur_row += 1
             if detail_truncated:
-                ws_det.cell(row=MAX_ROWS_PER_TAB + 4, column=1,
+                ws_det.cell(row=cur_row, column=1,
                             value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+            ws_det.column_dimensions["A"].width = 35
+            ws_det.column_dimensions["B"].width = 60
             ws_det.column_dimensions["C"].width = 80
-            ws_det.column_dimensions["B"].width = 35
-            ws_det.column_dimensions["H"].width = 60
 
         wb.save(output_path)
         print(f"\nExcel report saved to: {output_path}")
@@ -1141,17 +1284,32 @@ class ReportGenerator:
     def _write_summary_tab(self, ws, stats_list: List[ModuleStats], mode: str,
                            grand_total: float, total_kernel_count: int,
                            global_cat_agg: Dict[str, List],
-                           header_font, header_fill, title_font):
-        """Write the Summary tab: top-level metrics, category breakdown, module time split."""
-        from openpyxl.styles import Font, PatternFill, numbers
+                           header_font, header_fill, title_font,
+                           top_type_names: set):
+        """Write the Summary tab: kernel time summary with detail tabs, category breakdown."""
+        from openpyxl.styles import Font, PatternFill
+
+        # Build wrapper chains and type totals
+        root_chains: Dict[str, List[str]] = {}
+        type_totals: Dict[str, float] = defaultdict(float)
+        self._collect_by_type_total(stats_list, type_totals, mode)
+        wrapper_types = self._find_wrapper_types(stats_list, mode)
+        type_children_map = self._build_type_children(stats_list)
+        root_types = {s.module_type for s in stats_list}
+        for rtype in root_types:
+            chain = self._trace_wrapper_chain_full(
+                rtype, wrapper_types, type_children_map, stats_list, mode)
+            root_chains[rtype] = chain
+        top_type_set = top_type_names
 
         row = 1
 
-        # --- Section 1: Top-level metrics ---
+        # --- Section 1: Kernel Time Summary ---
         ws.cell(row=row, column=1, value="Metric").font = header_font
         ws.cell(row=row, column=2, value="Value (us)").font = header_font
         ws.cell(row=row, column=3, value="Percentage").font = header_font
-        for c in range(1, 4):
+        ws.cell(row=row, column=4, value="Detail Tab").font = header_font
+        for c in range(1, 5):
             ws.cell(row=row, column=c).fill = header_fill
         row += 1
 
@@ -1161,7 +1319,6 @@ class ReportGenerator:
         ws.cell(row=row, column=1).font = Font(bold=True)
         row += 1
 
-        # Phase breakdown (prefill/decode if available, otherwise module-level split)
         root_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
         for s in stats_list:
             root_by_type[s.module_type].append(s)
@@ -1175,10 +1332,26 @@ class ReportGenerator:
                 (s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
                 for s in rlist)
             pct = rtype_total / grand_total * 100 if grand_total > 0 else 0
-            ws.cell(row=row, column=1, value=f"  {rtype}")
+            chain = root_chains.get(rtype, [rtype])
+            ws.cell(row=row, column=1, value=rtype)
             ws.cell(row=row, column=2, value=round(rtype_total, 1))
             ws.cell(row=row, column=3, value=f"{pct:.1f}%")
             row += 1
+            if len(chain) > 1:
+                for i, ctype in enumerate(chain[1:], 1):
+                    is_last = (i == len(chain) - 1)
+                    connector = "└── " if is_last else "├── "
+                    indent = "    " * i
+                    ct = type_totals.get(ctype, 0)
+                    ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
+                    ws.cell(row=row, column=1, value=f"{indent}{connector}{ctype}")
+                    ws.cell(row=row, column=2, value=round(ct, 1))
+                    ws.cell(row=row, column=3, value=f"{ct_pct:.1f}%")
+                    if ctype in top_type_set:
+                        ws.cell(row=row, column=4, value=ctype)
+                        for c in range(1, 5):
+                            ws.cell(row=row, column=c).font = Font(bold=True)
+                    row += 1
 
         row += 1  # blank row
 
@@ -1204,11 +1377,49 @@ class ReportGenerator:
             row += 1
 
         # Column widths
-        ws.column_dimensions["A"].width = 25
-        ws.column_dimensions["B"].width = 15
+        ws.column_dimensions["A"].width = 30
+        ws.column_dimensions["B"].width = 18
         ws.column_dimensions["C"].width = 18
-        ws.column_dimensions["D"].width = 15
+        ws.column_dimensions["D"].width = 25
         ws.column_dimensions["E"].width = 15
+
+        return row
+
+    def _embed_arch_diagram(self, ws, after_row: int,
+                            trace_path: str, config_path: Optional[str],
+                            output_path: str):
+        """Generate and embed architecture diagram PNG below the summary tables."""
+        try:
+            import importlib
+            import tempfile
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            from model_inspector import generate_arch_diagram
+            from openpyxl.drawing.image import Image as XlImage
+        except ImportError as e:
+            logger.debug("Skipping arch diagram: %s", e)
+            return
+
+        png_dir = os.path.dirname(os.path.abspath(output_path))
+        png_path = os.path.join(png_dir, "_arch_diagram_tmp.png")
+        try:
+            result = generate_arch_diagram(trace_path, png_path,
+                                           config_path=config_path)
+            if result and os.path.isfile(png_path):
+                img = XlImage(png_path)
+                anchor_row = after_row + 2
+                img.anchor = f"A{anchor_row}"
+                ws.add_image(img)
+                logger.info("Architecture diagram embedded at row %d", anchor_row)
+        except Exception as e:
+            logger.warning("Failed to generate arch diagram: %s", e)
+        finally:
+            if os.path.isfile(png_path):
+                try:
+                    os.unlink(png_path)
+                except OSError:
+                    pass
 
     def _write_type_row(self, ws, row: int, label: str, depth: int, count: int,
                         times: List[float], parent_time: float,
@@ -1420,6 +1631,105 @@ class ReportGenerator:
 
         return row
 
+    @staticmethod
+    def _find_wrapper_types(stats_list: List[ModuleStats], mode: str,
+                            threshold: float = 0.8) -> set:
+        """Find module types that are thin wrappers around a dominant child.
+
+        A type is a wrapper if, in its representative instance, a single child
+        type accounts for >threshold of its total time.  These are skipped in
+        auto-selection to prefer the smaller repetitive unit.
+        Applies transitively: if A wraps B wraps C, both A and B are skipped.
+        """
+        # Collect one representative per type (first instance seen)
+        reps: Dict[str, ModuleStats] = {}
+        ReportGenerator._collect_first_instance(stats_list, reps)
+
+        skip: set = set()
+        for mtype, rep in reps.items():
+            parent_time = (rep.total_kernel_time if mode == "full"
+                           else rep.total_cpu_op_time)
+            if parent_time <= 0 or not rep.children_stats:
+                continue
+            # Group children by type within this one instance
+            child_by_type: Dict[str, float] = defaultdict(float)
+            for c in rep.children_stats:
+                ct = c.total_kernel_time if mode == "full" else c.total_cpu_op_time
+                child_by_type[c.module_type] += ct
+            for ctype, ctime in child_by_type.items():
+                if ctime / parent_time > threshold:
+                    skip.add(mtype)
+                    break
+        return skip
+
+    @staticmethod
+    def _collect_first_instance(stats_list: List[ModuleStats],
+                                out: Dict[str, ModuleStats]):
+        """Collect first instance of each module type from the tree."""
+        for s in stats_list:
+            if s.module_type not in out:
+                out[s.module_type] = s
+            ReportGenerator._collect_first_instance(s.children_stats, out)
+
+    @staticmethod
+    def _build_type_children(stats_list: List[ModuleStats]) -> Dict[str, set]:
+        """Build parent_type -> set of direct child types from the stats tree."""
+        result: Dict[str, set] = defaultdict(set)
+        for s in stats_list:
+            for child in s.children_stats:
+                result[s.module_type].add(child.module_type)
+            child_map = ReportGenerator._build_type_children(s.children_stats)
+            for ptype, ctypes in child_map.items():
+                result[ptype].update(ctypes)
+        return result
+
+    @staticmethod
+    def _all_descendant_types(mtype: str, type_children: Dict[str, set]) -> set:
+        """Get all transitive descendant types of a given module type."""
+        result: set = set()
+        stack = list(type_children.get(mtype, set()))
+        while stack:
+            ct = stack.pop()
+            if ct not in result:
+                result.add(ct)
+                stack.extend(type_children.get(ct, set()))
+        return result
+
+    @staticmethod
+    def _trace_wrapper_chain(mtype: str, wrapper_types: set,
+                             type_children: Dict[str, set],
+                             stats_list: List[ModuleStats],
+                             mode: str) -> str:
+        """Follow wrapper chain from mtype to the first non-wrapper descendant."""
+        chain = ReportGenerator._trace_wrapper_chain_full(
+            mtype, wrapper_types, type_children, stats_list, mode)
+        return chain[-1] if chain else mtype
+
+    @staticmethod
+    def _trace_wrapper_chain_full(mtype: str, wrapper_types: set,
+                                  type_children: Dict[str, set],
+                                  stats_list: List[ModuleStats],
+                                  mode: str) -> List[str]:
+        """Follow wrapper chain, returning the full list [mtype, child, ..., leaf]."""
+        reps: Dict[str, ModuleStats] = {}
+        ReportGenerator._collect_first_instance(stats_list, reps)
+        chain = [mtype]
+        current = mtype
+        visited: set = set()
+        while current in wrapper_types and current not in visited:
+            visited.add(current)
+            rep = reps.get(current)
+            if not rep or not rep.children_stats:
+                break
+            child_by_type: Dict[str, float] = defaultdict(float)
+            for c in rep.children_stats:
+                ct = c.total_kernel_time if mode == "full" else c.total_cpu_op_time
+                child_by_type[c.module_type] += ct
+            best_child = max(child_by_type, key=child_by_type.get)
+            chain.append(best_child)
+            current = best_child
+        return chain
+
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
                                        seen: Dict[Tuple[str, str], ModuleStats],
                                        mode: str,
@@ -1507,8 +1817,9 @@ class TraceModuleAnalyzer:
                  output_path: Optional[str] = None,
                  detail_modules: Optional[List[str]] = None,
                  detail_instance: Optional[int] = None,
-                 top_n_types: int = 5, show_tree: bool = False,
-                 auto_fix_rocm: bool = True):
+                 top_n_types: int = 3, show_tree: bool = False,
+                 auto_fix_rocm: bool = True,
+                 config_path: Optional[str] = None):
         self.trace_path = trace_path
         self.top_n = top_n
         self.output_path = output_path
@@ -1517,6 +1828,7 @@ class TraceModuleAnalyzer:
         self.top_n_types = top_n_types
         self.show_tree = show_tree
         self.auto_fix_rocm = auto_fix_rocm
+        self.config_path = config_path
 
     def run(self):
         # Step 1: Load trace with single-pass categorization
@@ -1660,7 +1972,9 @@ class TraceModuleAnalyzer:
 
         # Step 6: Output
         reporter = ReportGenerator()
-        reporter.print_type_summary(stats_list, mode)
+        reporter.print_type_summary(stats_list, mode,
+                                    top_n_types=self.top_n_types,
+                                    detail_modules=self.detail_modules)
 
         for dm in self.detail_modules:
             reporter.print_layer_detail(stats_list, mode, dm,
@@ -1674,7 +1988,9 @@ class TraceModuleAnalyzer:
         if self.output_path:
             reporter.export_excel(stats_list, mode, self.output_path,
                                   top_n_types=self.top_n_types,
-                                  detail_modules=self.detail_modules)
+                                  detail_modules=self.detail_modules,
+                                  trace_path=self.trace_path,
+                                  config_path=self.config_path)
 
     def _propagate_phase(self, nodes: List[ModuleNode]):
         """Propagate phase from parent to children if not set."""
@@ -1762,8 +2078,8 @@ Examples:
                         help="Output Excel file path (.xlsx)")
     parser.add_argument("--top-n", type=int, default=5,
                         help="Top N kernels to show per module (default: 5)")
-    parser.add_argument("--top-n-types", type=int, default=5,
-                        help="Top N module types in 'By Module Type' sheet (default: 5, 0=all)")
+    parser.add_argument("--top-n-types", type=int, default=3,
+                        help="Top N module types for detail sheets (default: 3, 0=all)")
     parser.add_argument("--detail-module", nargs="+", default=None,
                         help="Show kernel-by-kernel detail for module type(s) "
                              "(e.g. --detail-module WanTransformerBlock FSDPT5Block)")
@@ -1771,6 +2087,8 @@ Examples:
                         help="Which instance to show detail for (default: 1)")
     parser.add_argument("--show-tree", action="store_true",
                         help="Print full module tree to console (verbose)")
+    parser.add_argument("--config", metavar="PATH", default=None,
+                        help="Path to HuggingFace config.json (enriches architecture diagram)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1799,6 +2117,7 @@ Examples:
             top_n_types=args.top_n_types if args.top_n_types > 0 else 999,
             show_tree=args.show_tree,
             auto_fix_rocm=not args.no_rocm_fix,
+            config_path=args.config,
         )
         analyzer.run()
     except FileNotFoundError as e:
