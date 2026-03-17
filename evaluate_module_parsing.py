@@ -30,7 +30,7 @@ import openpyxl
 W_S1_PHASE_COVERAGE       = 25   # S1: Phase coverage (prefill/decode detected)
 W_S2_ARCHITECTURE_SIG     = 25   # S2: Architecture signature regularity
 W_S3_INSTANCE_CONSISTENCY = 25   # S3: Instance count consistency across sibling types
-W_S4_TIME_DISTRIBUTION    = 25   # S4: Time distribution consistency (low CV)
+W_S4_TIME_CONSISTENCY     = 25   # S4: Time consistency across instances (low CV)
 
 
 # ── Data model ───────────────────────────────────────────────────────────────
@@ -90,7 +90,10 @@ class DetailSheetInfo:
 
 
 # ── Known sheets (not detail tabs) ──────────────────────────────────────────
-_KNOWN_SHEETS = {"Summary", "Overview", "Module Tree", "GPU Kernels", "Model Info (WIP)"}
+_KNOWN_SHEETS = {
+    "Summary", "Overview", "Module Tree", "GPU Kernels", "Model Info (WIP)",
+    "By Module Type", "Kernel Breakdown", "Kernel Detail",
+}
 
 
 # ── Excel parsing functions ─────────────────────────────────────────────────
@@ -279,6 +282,9 @@ def _parse_detail_sheets(wb) -> List[DetailSheetInfo]:
 
         in_categories = False
         in_kernels = False
+        # Column layout variant: "original" = (Module, InputDims, KernelName, Dur, ?, Cat)
+        #                        "numbered" = (#, Module, KernelName, Cat, Dur, %wall, Phase, InputDims)
+        kernel_layout = "original"
 
         for i, row in enumerate(rows[2:], start=2):
             cell0 = str(row[0]).strip() if row[0] is not None else ""
@@ -289,12 +295,23 @@ def _parse_detail_sheets(wb) -> List[DetailSheetInfo]:
                 in_kernels = False
                 continue
 
-            # Detect kernel detail header
+            # Detect kernel detail header — original layout: (Module, ?, Kernel Name, ...)
             if cell0 == "Module" and len(row) > 3:
-                cell3 = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
-                if cell3 == "Kernel Name":
+                cell2 = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
+                if cell2 == "Kernel Name":
                     in_categories = False
                     in_kernels = True
+                    kernel_layout = "original"
+                    continue
+
+            # Detect kernel detail header — numbered layout: (#, Module, Kernel Name, Category, Duration, ...)
+            if cell0 == "#" and len(row) > 4:
+                cell1 = str(row[1]).strip() if row[1] is not None else ""
+                cell2 = str(row[2]).strip() if row[2] is not None else ""
+                if cell1 == "Module" and cell2 == "Kernel Name":
+                    in_categories = False
+                    in_kernels = True
+                    kernel_layout = "numbered"
                     continue
 
             if in_categories:
@@ -312,11 +329,18 @@ def _parse_detail_sheets(wb) -> List[DetailSheetInfo]:
                 if not cell0 or cell0.startswith("... truncated"):
                     continue
                 try:
-                    module_inst = cell0
-                    input_dims = str(row[1]) if len(row) > 1 and row[1] is not None else ""
-                    kernel_name = str(row[2]) if len(row) > 2 and row[2] is not None else ""
-                    duration = float(row[3]) if len(row) > 3 and row[3] is not None else 0.0
-                    category = str(row[5]) if len(row) > 5 and row[5] is not None else ""
+                    if kernel_layout == "numbered":
+                        module_inst = str(row[1]) if len(row) > 1 and row[1] is not None else ""
+                        kernel_name = str(row[2]) if len(row) > 2 and row[2] is not None else ""
+                        category = str(row[3]) if len(row) > 3 and row[3] is not None else ""
+                        duration = float(row[4]) if len(row) > 4 and row[4] is not None else 0.0
+                        input_dims = str(row[7]) if len(row) > 7 and row[7] is not None else ""
+                    else:
+                        module_inst = cell0
+                        input_dims = str(row[1]) if len(row) > 1 and row[1] is not None else ""
+                        kernel_name = str(row[2]) if len(row) > 2 and row[2] is not None else ""
+                        duration = float(row[3]) if len(row) > 3 and row[3] is not None else 0.0
+                        category = str(row[5]) if len(row) > 5 and row[5] is not None else ""
                     kernels.append((module_inst, input_dims, kernel_name, duration, category))
                 except (ValueError, TypeError):
                     continue
@@ -344,6 +368,22 @@ def _grade(score: float) -> str:
     return "F"
 
 
+_LLM_INDICATOR_TYPES = {
+    "logitsprocessor", "sampler", "lmhead", "lm_head",
+    "forcausallm", "causallm", "radixattention",
+}
+
+
+def _is_llm_model(overview_records: List[ModuleTypeRecord]) -> bool:
+    """Detect LLM inference models by checking for LLM-specific module types."""
+    all_types = {r.module_type.lower() for r in overview_records}
+    for t in all_types:
+        for indicator in _LLM_INDICATOR_TYPES:
+            if indicator in t:
+                return True
+    return False
+
+
 def _score_s1_phase_coverage(
     tree_entries: List[ModuleTreeEntry],
     overview_records: List[ModuleTypeRecord],
@@ -355,29 +395,31 @@ def _score_s1_phase_coverage(
         if phase:
             phases_detected.add(phase)
 
-    # Check root types exist in overview
     root_types = [r for r in overview_records if r.depth == 0]
     n_root = len(root_types)
+    is_llm = _is_llm_model(overview_records)
 
     if not phases_detected and n_root == 0:
         return 0.0, "no_phases_or_roots"
 
     score = 0.0
-    # Having root types is fundamental
     if n_root > 0:
         score += 50.0
 
-    # Having phases detected
     if "prefill" in phases_detected or "pre" in phases_detected:
         score += 25.0
     if "decode" in phases_detected or "dec" in phases_detected:
         score += 25.0
 
-    # If no phases but root types exist, that's still partly OK (e.g. diffusion models)
     if not phases_detected and n_root > 0:
-        score = 70.0  # Partial credit
+        if is_llm:
+            score = 25.0  # LLM should have phases — parsing problem
+        else:
+            score = 100.0  # Non-LLM: phases not applicable
 
-    detail = f"phases_detected={{{','.join(sorted(phases_detected))}}}, root_types={n_root}"
+    model_tag = "llm" if is_llm else "non-llm"
+    detail = (f"phases_detected={{{','.join(sorted(phases_detected))}}}, "
+              f"root_types={n_root}, model={model_tag}")
     return min(score, 100.0), detail
 
 
@@ -466,15 +508,71 @@ def _score_s3_instance_consistency(
     return score, detail
 
 
-def _score_s4_time_distribution(
+def _cv_to_score_llm(cv: float) -> float:
+    """CV → score mapping for LLM models (strict: identical layers expected)."""
+    if cv < 0.05:
+        return 100.0
+    if cv < 0.10:
+        return 80.0
+    if cv < 0.20:
+        return 60.0
+    if cv < 0.50:
+        return 40.0
+    return 20.0
+
+
+def _cv_to_score_nonllm(cv: float) -> float:
+    """CV → score mapping for non-LLM models (relaxed: some variance expected)."""
+    if cv < 0.10:
+        return 100.0
+    if cv < 0.30:
+        return 80.0
+    if cv < 0.50:
+        return 60.0
+    if cv < 1.0:
+        return 40.0
+    return 20.0
+
+
+def _score_s4_time_consistency(
     overview_records: List[ModuleTypeRecord],
+    is_llm: bool = True,
 ) -> Tuple[float, str]:
-    """S4: Time Distribution Consistency — low CV for repetitive module types."""
-    # Filter to types with count >= 3 and depth >= 1
+    """S4: Time Distribution Consistency — low CV for repetitive module types.
+
+    For non-LLM models (diffusion, video, etc.), multi-scale architectures
+    reuse the same module type at different resolutions, causing naturally high
+    CV.  We handle this by:
+      1. Excluding "shared primitives" — types that appear at multiple
+         positions in the hierarchy (they span different structural contexts).
+      2. Using relaxed CV thresholds for the remaining positional types.
+    """
     eligible = [r for r in overview_records if r.count >= 3 and r.depth >= 1]
 
+    cv_fn = _cv_to_score_llm
+    skipped = 0
+
+    if not is_llm and eligible:
+        from collections import Counter
+        type_occurrences = Counter(
+            r.module_type for r in overview_records if r.depth >= 1)
+        before = len(eligible)
+        eligible = [r for r in eligible
+                    if type_occurrences[r.module_type] == 1]
+        skipped = before - len(eligible)
+        cv_fn = _cv_to_score_nonllm
+
+    # Dedup by identity (same pool shown at multiple hierarchy positions)
+    seen: set = set()
+    deduped: List[ModuleTypeRecord] = []
+    for r in eligible:
+        key = (r.module_type, r.count, r.mean_us, r.std_us)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+    eligible = deduped
+
     if not eligible:
-        # If no eligible types, check root types
         eligible = [r for r in overview_records if r.count >= 3 and r.depth == 0]
 
     if not eligible:
@@ -491,18 +589,8 @@ def _score_s4_time_distribution(
         else:
             cv = 0.0
 
-        if cv < 0.05:
-            ts = 100.0
-        elif cv < 0.10:
-            ts = 80.0
-        elif cv < 0.20:
-            ts = 60.0
-        elif cv < 0.50:
-            ts = 40.0
-        else:
-            ts = 20.0
+        ts = cv_fn(cv)
 
-        # Weight by total time (more important modules count more)
         type_scores.append((ts, r.total_us))
         cv_sum += cv
 
@@ -510,7 +598,6 @@ def _score_s4_time_distribution(
             worst_cv = cv
             worst_type = r.module_type
 
-    # Weighted average
     total_weight = sum(w for _, w in type_scores)
     if total_weight > 0:
         score = sum(s * w for s, w in type_scores) / total_weight
@@ -519,9 +606,11 @@ def _score_s4_time_distribution(
 
     avg_cv = cv_sum / len(eligible) if eligible else 0.0
 
+    model_tag = "llm" if is_llm else f"non-llm, {skipped} shared types excluded"
     detail = (f"types_scored={len(eligible)}, "
               f"worst_cv={worst_type}:{worst_cv:.3f}, "
-              f"avg_cv={avg_cv:.3f}")
+              f"avg_cv={avg_cv:.3f}, "
+              f"model={model_tag}")
     return score, detail
 
 
@@ -547,8 +636,19 @@ def _compute_group_diagnostics(
     """Compute per-group diagnostics for eligible module types."""
     diagnostics = []
 
-    # Eligible: depth >= 1, count >= 3
-    eligible = [r for r in overview_records if r.count >= 3 and r.depth >= 1]
+    # Eligible: depth >= 1, count >= 3, deduplicated by identity
+    # The same module type can appear multiple times in the hierarchy under
+    # different parents with identical aggregated stats — keep only one.
+    seen: set = set()
+    eligible: List[ModuleTypeRecord] = []
+    for r in overview_records:
+        if r.count < 3 or r.depth < 1:
+            continue
+        key = (r.module_type, r.count, r.mean_us, r.std_us)
+        if key in seen:
+            continue
+        seen.add(key)
+        eligible.append(r)
 
     # Build detail sheet lookup
     detail_by_type: Dict[str, List[DetailSheetInfo]] = {}
@@ -606,6 +706,34 @@ def _compute_group_diagnostics(
     return diagnostics
 
 
+# ── Sheet name resolution ────────────────────────────────────────────────────
+
+def _resolve_sheet_names(wb) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve Overview/Summary sheet names, handling alternate layouts.
+
+    Some analyzer versions emit the module-type hierarchy under "Summary"
+    instead of a dedicated "Overview" sheet. Detect this by inspecting the
+    first header cell and remap accordingly.
+
+    Returns (overview_sheet_name, summary_sheet_name) — either may be None.
+    """
+    if "Overview" in wb.sheetnames:
+        overview = "Overview"
+        summary = "Summary" if "Summary" in wb.sheetnames else None
+        return overview, summary
+
+    if "Summary" in wb.sheetnames:
+        ws = wb["Summary"]
+        first_row = next(ws.iter_rows(values_only=True, max_row=1), None)
+        if first_row:
+            hdr = str(first_row[0]).strip().lower().replace("_", " ")
+            if hdr in ("module type", "module_type", "moduletype"):
+                return "Summary", None
+        return None, "Summary"
+
+    return None, None
+
+
 # ── Main evaluator ───────────────────────────────────────────────────────────
 
 class ModuleParsingEvaluator:
@@ -622,10 +750,12 @@ class ModuleParsingEvaluator:
         self.tree_entries = []
         self.detail_sheets = []
 
-        if "Summary" in self.wb.sheetnames:
-            self.overall_stats, self.categories = _parse_summary_sheet(self.wb["Summary"])
-        if "Overview" in self.wb.sheetnames:
-            self.overview_records = _parse_overview_sheet(self.wb["Overview"])
+        overview_sheet, summary_sheet = _resolve_sheet_names(self.wb)
+
+        if summary_sheet:
+            self.overall_stats, self.categories = _parse_summary_sheet(self.wb[summary_sheet])
+        if overview_sheet:
+            self.overview_records = _parse_overview_sheet(self.wb[overview_sheet])
         if "Module Tree" in self.wb.sheetnames:
             self.tree_entries = _parse_module_tree_sheet(self.wb["Module Tree"])
 
@@ -639,11 +769,13 @@ class ModuleParsingEvaluator:
 
     def _compute_scores(self) -> Dict[str, Dict[str, Any]]:
         """Compute S1-S4 structural rule scores."""
+        is_llm = _is_llm_model(self.overview_records)
         s1_score, s1_detail = _score_s1_phase_coverage(
             self.tree_entries, self.overview_records)
         s2_score, s2_detail = _score_s2_architecture_sig(self.overview_records)
         s3_score, s3_detail = _score_s3_instance_consistency(self.overview_records)
-        s4_score, s4_detail = _score_s4_time_distribution(self.overview_records)
+        s4_score, s4_detail = _score_s4_time_consistency(
+            self.overview_records, is_llm=is_llm)
 
         return {
             "s1_phase_coverage": {
@@ -664,10 +796,10 @@ class ModuleParsingEvaluator:
                 "weight": W_S3_INSTANCE_CONSISTENCY,
                 "detail": s3_detail,
             },
-            "s4_time_distribution": {
+            "s4_time_consistency": {
                 "score": round(s4_score, 1),
                 "grade": _grade(s4_score),
-                "weight": W_S4_TIME_DISTRIBUTION,
+                "weight": W_S4_TIME_CONSISTENCY,
                 "detail": s4_detail,
             },
         }
@@ -679,6 +811,76 @@ class ModuleParsingEvaluator:
         for rule in self.scores.values():
             total += rule["score"] * rule["weight"] / 100.0
         return round(total, 1)
+
+    def _ordered_diagnostics(
+        self,
+    ) -> List[Tuple[str, int, Optional[GroupDiagnostic]]]:
+        """Walk overview_records to produce tree-ordered diagnostics.
+
+        Returns list of (root_type_name, depth, diagnostic_or_None).
+        Entries with diagnostic=None are root type headers (depth 0).
+        """
+        diag_by_key: Dict[Tuple[str, int], GroupDiagnostic] = {}
+        for d in self.diagnostics:
+            diag_by_key.setdefault((d.module_type, d.count), d)
+
+        result: List[Tuple[str, int, Optional[GroupDiagnostic]]] = []
+        current_root = ""
+        emitted_roots: set = set()
+        seen_diag_keys: set = set()
+
+        for r in self.overview_records:
+            if r.depth == 0:
+                current_root = r.module_type
+                continue
+
+            key = (r.module_type, r.count)
+            if key in seen_diag_keys:
+                continue
+
+            diag = diag_by_key.get(key)
+            if diag is None:
+                continue
+
+            seen_diag_keys.add(key)
+            if current_root not in emitted_roots:
+                emitted_roots.add(current_root)
+                result.append((current_root, 0, None))
+            result.append((current_root, r.depth, diag))
+
+        return result
+
+    @staticmethod
+    def _tree_labels(
+        ordered: List[Tuple[str, int, Optional[GroupDiagnostic]]],
+    ) -> List[str]:
+        """Compute tree-prefixed label for every entry in *ordered*."""
+        n = len(ordered)
+        labels: List[str] = []
+
+        for i, (root_type, depth, diag) in enumerate(ordered):
+            if diag is None:
+                labels.append(root_type)
+                continue
+
+            parts: List[str] = []
+            for d in range(1, depth + 1):
+                has_sibling = False
+                for j in range(i + 1, n):
+                    _, jd, jdiag = ordered[j]
+                    if jdiag is None or jd < d:
+                        break
+                    if jd == d:
+                        has_sibling = True
+                        break
+                if d == depth:
+                    parts.append("├── " if has_sibling else "└── ")
+                else:
+                    parts.append("│   " if has_sibling else "    ")
+
+            labels.append("".join(parts) + diag.module_type)
+
+        return labels
 
     def export_csv(self, output_dir: str = ".") -> str:
         """Export evaluation summary as CSV. Returns the output path."""
@@ -696,17 +898,28 @@ class ModuleParsingEvaluator:
                 "detail": data["detail"],
             })
 
-        # Group diagnostics
-        for diag in self.diagnostics:
-            rows.append({
-                "section": "group_diagnostics",
-                "metric": diag.module_type,
-                "score": round(diag.composite_score, 1),
-                "grade": _grade(diag.composite_score),
-                "detail": (f"count={diag.count}, depth={diag.depth}, "
-                          f"time_cv={diag.time_consistency_detail}, "
-                          f"kernel={diag.kernel_pattern_detail}"),
-            })
+        # Group diagnostics (tree-ordered)
+        ordered = self._ordered_diagnostics()
+        labels = self._tree_labels(ordered)
+        for label, (root_type, depth, diag) in zip(labels, ordered):
+            if diag is None:
+                rows.append({
+                    "section": "group_diagnostics",
+                    "metric": label,
+                    "score": "",
+                    "grade": "",
+                    "detail": "root_type",
+                })
+            else:
+                rows.append({
+                    "section": "group_diagnostics",
+                    "metric": label,
+                    "score": round(diag.composite_score, 1),
+                    "grade": _grade(diag.composite_score),
+                    "detail": (f"count={diag.count}, depth={diag.depth}, "
+                              f"time_cv={diag.time_consistency_detail}, "
+                              f"kernel={diag.kernel_pattern_detail}"),
+                })
 
         # Composite
         rows.append({
@@ -768,17 +981,26 @@ class ModuleParsingEvaluator:
         for key, data in self.scores.items():
             print(f"  {key:<28} | {data['score']:>6.1f} | {data['grade']:>5} | {data['detail']}")
 
-        # Group diagnostics
-        if self.diagnostics:
+        # Group diagnostics (tree-ordered)
+        ordered = self._ordered_diagnostics()
+        if ordered:
+            col_w = 44
+            labels = self._tree_labels(ordered)
+            tc = "Time Consistency"
+            kc = "Pattern Consistency"
+            ts = "Total Score"
             print()
             print("--- Group Diagnostics ---")
-            print(f"  {'Module Type':<30} | {'Count':>5} | {'Time':>6} | {'Kernel':>6} | {'Score':>6}")
-            print(f"  {'-'*30}-+-{'-'*5}-+-{'-'*6}-+-{'-'*6}-+-{'-'*6}")
-            for d in self.diagnostics:
-                print(f"  {d.module_type:<30} | {d.count:>5} | "
-                      f"{d.time_consistency_score:>6.1f} | "
-                      f"{d.kernel_pattern_score:>6.1f} | "
-                      f"{d.composite_score:>6.1f}")
+            print(f"  {'Module':<{col_w}} | {'Count':>5} | {tc:>16} | {kc:>21} | {ts:>11}")
+            print(f"  {'-'*col_w}-+-{'-'*5}-+-{'-'*16}-+-{'-'*21}-+-{'-'*11}")
+            for label, (root_type, depth, diag) in zip(labels, ordered):
+                if diag is None:
+                    print(f"  {label}")
+                else:
+                    print(f"  {label:<{col_w}} | {diag.count:>5} | "
+                          f"{diag.time_consistency_score:>16.1f} | "
+                          f"{diag.kernel_pattern_score:>21.1f} | "
+                          f"{diag.composite_score:>11.1f}")
 
         print()
         print(f"  Composite Score: {self.composite_score:.1f} ({_grade(self.composite_score)})")

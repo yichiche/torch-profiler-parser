@@ -1148,7 +1148,7 @@ class ReportGenerator:
             type_row += 1
             if rep.children_stats:
                 type_row, _ = self._write_children_hierarchy(
-                    ws_ov, rep, mode, type_row, rep_time, stats_list)
+                    ws_ov, rep, mode, type_row, rep_time, rlist)
         ws_ov.column_dimensions["A"].width = 40
         ws_ov.column_dimensions["J"].width = 80
 
