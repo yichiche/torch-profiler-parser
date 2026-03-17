@@ -9,26 +9,22 @@ Built for analyzing large model inference (LLMs, diffusion models, MoE architect
 | Tool | Description |
 |------|-------------|
 | `trace_module_analyzer.py` | Primary trace parser. Correlates CPU module spans with GPU kernels to produce per-module kernel breakdown reports. |
-| `evaluate_module_parsing.py` | Evaluates trace parsing quality with structural scoring (S1-S4). |
 | `model_inspector.py` | Static model structure analysis from Python source, plus trace-based architecture diagrams. |
+| `evaluate_module_parsing.py` | Evaluates trace parsing quality with structural scoring (S1-S4). |
 | `fix_rocm_trace_flow.py` | Fixes missing CUDA-graph flow events in ROCm traces. Auto-applied by the analyzer. |
 
 ## Quick Start
 
 ```bash
-pip install torch-profiler-parser
+git clone https://github.com/yichiche/torch-profiler-parser.git
+cd torch-profiler-parser
+pip install -e .
 
 # Analyze a trace
 python3 trace_module_analyzer.py trace.json.gz -o report.xlsx
 
 # With HuggingFace model config for enrichment
-python3 trace_module_analyzer.py trace.json.gz -o report.xlsx --config config.json
-
-# Show module tree
-python3 trace_module_analyzer.py trace.json.gz --show-tree
-
-# Inspect model structure from source
-python3 model_inspector.py deepseek_v2.py --profiler-tree --config config.json
+python3 trace_module_analyzer.py trace.json.gz -o report.xlsx --config model_path/config.json
 
 # Evaluate parsing quality
 python3 evaluate_module_parsing.py report.xlsx --json
