@@ -4,58 +4,123 @@ You are an expert at analyzing SGLang GPU profiling data. Use this guide to unde
 
 ## Profiling Toolchain Overview
 
-The profiling tools live in `/home/yichiche/agent-box/profile/`. They form a pipeline:
+The profiling tools live in `/home/yichiche/agent-box/profile/`. The primary tool is `trace_module_analyzer.py`, which uses nn.Module correlation to classify GPU kernels by their owning module rather than regex pattern matching.
 
 ```
 Raw Trace (.trace.json.gz)
   │
-  ├─► trace_analyzer.py ──► profile.csv.xlsx  (per-layer kernel breakdown)
-  │                     └──► trace_analyzer.log (analysis log)
+  ├─► trace_module_analyzer.py ──► report.xlsx  (module-level kernel breakdown)
+  │     (optionally applies fix_rocm_trace_flow.py for ROCm traces)
   │
-  ├─► evaluate_parsing.py ──► evaluation_summary.csv (quality scores)
-  │                       └──► evaluate_parsing.log  (diagnostics)
-  │
-  └─► compare_traces.py ──► diff_report.xlsx (kernel diff between two versions)
+  └─► model_inspector.py ──► model structure tree / architecture diagrams
+        (standalone, or enriches trace_module_analyzer output)
+```
 
-model_inspector.py ──► (standalone) static model structure from source code
+### Legacy Pipeline (still used by perf-regression)
+
+The perf-regression orchestrator, bisect.sh, and benchmark scripts still call these:
+
+```
+trace_analyzer.py  ──► profile.csv.xlsx   (rule-based per-layer kernel breakdown)
+evaluate_parsing.py ──► evaluation_summary.csv  (quality scores for trace_analyzer output)
+```
+
+These scripts are kept for backward compatibility but are **not** the primary analysis tools.
+
+## Tools Reference
+
+### trace_module_analyzer.py — Primary Trace Parser
+
+Correlation-based GPU kernel classification using nn.Module hierarchy from PyTorch profiler traces. Works with both LLM traces (CPU-only module spans) and diffusion model traces (with GPU kernel events).
+
+```bash
+# Basic analysis
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz -o report.xlsx
+
+# Enrich with HuggingFace config (adds head counts, vocab size, expert config)
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz -o report.xlsx --config config.json
+
+# Show kernel-by-kernel detail for a specific module type
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock
+
+# Show specific instance
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --detail-instance 5
+
+# Show full module tree
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --show-tree
+
+# Disable automatic ROCm trace fix
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --no-rocm-fix
+```
+
+### fix_rocm_trace_flow.py — ROCm Trace Fix
+
+Fixes missing CUDA-graph flow events in ROCm/MI355 traces. Automatically applied by `trace_module_analyzer.py` unless `--no-rocm-fix` is passed. Can also be used standalone:
+
+```bash
+python3 /home/yichiche/agent-box/profile/fix_rocm_trace_flow.py trace.json.gz -o trace_fixed.json.gz
+python3 /home/yichiche/agent-box/profile/fix_rocm_trace_flow.py trace.json.gz --in-place
+```
+
+### model_inspector.py — Model Structure Inspector
+
+Static model structure analysis from Python source code, plus trace-based architecture diagrams.
+
+```bash
+# List classes in a model file
+python3 /home/yichiche/agent-box/profile/model_inspector.py deepseek_v2.py --list-classes
+
+# Show module hierarchy tree
+python3 /home/yichiche/agent-box/profile/model_inspector.py deepseek_v2.py --root DeepseekV2ForCausalLM
+
+# PyTorch-profiler-style tree with layer instances expanded
+python3 /home/yichiche/agent-box/profile/model_inspector.py deepseek_v2.py --profiler-tree --config config.json
+
+# Generate architecture block diagram from a trace file
+python3 /home/yichiche/agent-box/profile/model_inspector.py --trace trace.json.gz --arch-diagram
+python3 /home/yichiche/agent-box/profile/model_inspector.py --trace trace.json.gz --arch-diagram --detailed
+```
+
+### trace_analyzer.py — Legacy Rule-Based Parser
+
+> **Note:** This is the older regex/rule-based trace parser. It is kept because the perf-regression pipeline (`debug/perf-regression/orchestrator.py`, `debug/bisect.sh`, `benchmark/run-local-benchmark-e2e.sh`) still depends on its CLI and Excel output format. For new analysis, use `trace_module_analyzer.py` instead.
+
+```bash
+python3 /home/yichiche/agent-box/profile/trace_analyzer.py trace.json.gz -o output.xlsx
+```
+
+### evaluate_parsing.py — Legacy Quality Evaluator
+
+> **Note:** Evaluates the output of `trace_analyzer.py`. Kept for perf-regression pipeline compatibility.
+
+```bash
+python3 /home/yichiche/agent-box/profile/evaluate_parsing.py output.xlsx --json
 ```
 
 ## Output File Formats
 
-### profile.csv.xlsx — Per-Layer Kernel Breakdown (Primary Analysis Output)
+### trace_module_analyzer.py Output (report.xlsx)
 
-An Excel workbook produced by `trace_analyzer.py`. Contains:
+An Excel workbook with module-level kernel breakdown:
 
-- **Summary sheet**: Overall stats — total kernel time, prefill/decode split, time breakdown by kernel type (attention, MoE, quantization, communication, linear, memory, other), and a per-layer table with columns: Layer Index, Layer Type, Stage, Total Time, Kernel Count, plus per-type time columns.
-- **Layer_N sheets** (one per detected layer): Detailed kernel sequence for that layer with columns: `#` (position), `Duration (us)`, `%` (fraction of layer), `Type` (kernel type), `Short Name` (simplified), `Kernel Name` (full GPU kernel name).
+- **Summary sheet**: Overall stats — total time, module type breakdown, top kernels per module type
+- **Module type sheets**: Per-module-type detail with kernel lists, timing, and percentages
+- **Model Info sheet** (with `--config`): HuggingFace model configuration details
+
+### trace_analyzer.py Output (profile.csv.xlsx) — Legacy
+
+An Excel workbook with per-layer kernel breakdown:
+
+- **Summary sheet**: Overall stats — total kernel time, prefill/decode split, time breakdown by kernel type (attention, MoE, quantization, communication, linear, memory, other), per-layer table
+- **Layer_N sheets**: Detailed kernel sequence per detected layer
 
 **Key layer types**: `MLA+MoE`, `MLA+FC`, `MHA+MoE`, `MHA+FC`, `GDN+MoE`, `GDN+FC`
 **Key stages**: `prefill`, `decode`
 **Key kernel types**: `attention`, `moe`, `quantization`, `communication`, `linear`, `memory`, `other`
 
-### evaluation_summary.csv — Parsing Quality Assessment
+### evaluation_summary.csv — Legacy Quality Assessment
 
-CSV with columns: `section, metric, score, grade, detail`. Sections:
-
-- **structural**: 4 metrics (S1-S4) each scored 0-100:
-  - S1 Prefill Ordering: No decode layers appear before first prefill
-  - S2 Architecture Signature: First prefill round matches expected model pattern
-  - S3 Round Consistency: Decode rounds have consistent layer counts
-  - S4 Type Sequence: Kernel type pattern repeats within each round
-- **group**: Per-(stage, layer_type) metrics — `layers=N, time_cv=X, kern_cnt_mode=N(%), kern_pat=X%`
-- **overall**: Weighted composite score
-
-### evaluate_parsing.log — Diagnostic Details
-
-Human-readable quality report including the structural test results, per-group diagnostics table, and outlier analysis with specific layer indices.
-
-### trace_analyzer.log — Analysis Log
-
-Detailed log from the trace analyzer run including: events loaded, layer boundaries detected, merge operations, phase breakdown, timing summaries.
-
-### *.trace.json.gz — Raw Torch Profiler Trace
-
-Compressed JSON containing all GPU kernel events. Typically 30-100+ MB. Fields per event include: name, timestamp, duration, args (grid, block dims). This is the source input to `trace_analyzer.py`.
+CSV with structural scores (S1-S4), per-group metrics, and overall composite score. Produced by `evaluate_parsing.py` from `trace_analyzer.py` output. Used by perf-regression pipeline for quality gating.
 
 ## Typical Benchmark Run Directory Layout
 
@@ -71,10 +136,10 @@ Benchmark runs are stored under `/home/yichiche/benchmark_runs/`. A typical prof
 ├── version_snapshot.json               (version metadata)
 └── trace_analysis/
     ├── *.trace.json.gz                 (raw trace file)
-    ├── profile.csv.xlsx                (trace analysis output)
-    ├── trace_analyzer.log              (analysis log)
-    ├── evaluation_summary.csv          (quality scores)
-    └── evaluate_parsing.log            (quality diagnostics)
+    ├── profile.csv.xlsx                (legacy trace_analyzer output)
+    ├── trace_analyzer.log              (legacy analysis log)
+    ├── evaluation_summary.csv          (legacy quality scores)
+    └── evaluate_parsing.log            (legacy quality diagnostics)
 ```
 
 ## How to Analyze Profiling Data
@@ -88,58 +153,27 @@ ls /home/yichiche/benchmark_runs/
 
 Within a run directory, profiling outputs are in the `trace_analysis/` subdirectory.
 
-### Step 2: Read the evaluation summary first
+### Step 2: Run trace_module_analyzer
 
-Start with `evaluation_summary.csv` to check data quality. If the overall score is below 85, warn the user that the trace parsing may be unreliable and point out which structural metrics failed.
+For new analysis, use `trace_module_analyzer.py`:
+```bash
+python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py /path/to/trace.json.gz -o report.xlsx -v
+```
 
-### Step 3: Read the profile Excel for kernel analysis
+For existing legacy analysis, read the `profile.csv.xlsx` and `evaluation_summary.csv` files that were already generated.
 
-Use `openpyxl` or read the file to extract:
-- **Overall time split**: From the Summary sheet, get prefill vs decode percentage
-- **Kernel type breakdown**: Which kernel types dominate (attention? communication? MoE?)
-- **Per-layer patterns**: Read specific Layer_N sheets to see the kernel sequence
-
-### Step 4: Answer the user's question
+### Step 3: Answer the user's question
 
 Common questions and how to answer them:
 
 | Question | Where to look |
 |----------|---------------|
-| "What's the prefill/decode split?" | Summary sheet overall stats |
-| "Which kernel type takes the most time?" | Summary sheet type breakdown |
-| "What kernels run in layer N?" | Layer_N sheet in profile.csv.xlsx |
-| "Is the trace parsing reliable?" | evaluation_summary.csv overall score |
-| "How many layers were detected?" | Summary sheet layer table row count |
-| "Which layers are outliers?" | evaluate_parsing.log outlier section |
-| "Compare two versions" | Use compare_traces.py or read two profile.csv.xlsx files |
-| "What's the model architecture?" | Summary sheet layer types (MLA/MHA/GDN, MoE/FC pattern) |
-
-## Running the Tools
-
-If the user needs to generate new analysis from a raw trace:
-
-```bash
-# Analyze a trace file
-python3 /home/yichiche/agent-box/profile/trace_analyzer.py /path/to/trace.json.gz -o output.xlsx
-
-# With verbose output
-python3 /home/yichiche/agent-box/profile/trace_analyzer.py /path/to/trace.json.gz -o output.xlsx -v
-
-# Debug specific layers
-python3 /home/yichiche/agent-box/profile/trace_analyzer.py /path/to/trace.json.gz --debug-layers 0,1,2,3
-
-# Show layer breakdown in terminal
-python3 /home/yichiche/agent-box/profile/trace_analyzer.py /path/to/trace.json.gz --show-layer-terminal
-
-# Evaluate parsing quality
-python3 /home/yichiche/agent-box/profile/evaluate_parsing.py output.xlsx --json
-
-# Compare two trace analyses
-python3 /home/yichiche/agent-box/profile/compare_traces.py file_a.xlsx file_b.xlsx --output diff.xlsx --verbose
-
-# Inspect model structure (no GPU needed)
-python3 /home/yichiche/agent-box/profile/model_inspector.py /path/to/model.py --config /path/to/config.json
-```
+| "What modules take the most time?" | trace_module_analyzer summary sheet |
+| "What kernels run in module X?" | trace_module_analyzer --detail-module X |
+| "What's the model architecture?" | model_inspector --profiler-tree or --arch-diagram |
+| "What's the prefill/decode split?" | Legacy: profile.csv.xlsx Summary sheet |
+| "Is the trace parsing reliable?" | Legacy: evaluation_summary.csv overall score |
+| "Which layers are outliers?" | Legacy: evaluate_parsing.log outlier section |
 
 ## Key Concepts
 
@@ -150,25 +184,6 @@ python3 /home/yichiche/agent-box/profile/model_inspector.py /path/to/model.py --
 - **GDN (Gated Delta Network)**: Qwen3-Coder-Next linear attention variant.
 - **MoE (Mixture of Experts)**: Sparse expert layers with routing (DeepSeek, Grok-2, Qwen3).
 - **FC (Fully Connected)**: Dense MLP layers (first/last few layers in MoE models).
-- **Half-layers**: Models with dual norms (Grok-2, Qwen3) produce two layer boundaries per transformer block. These are auto-merged by default.
 - **ALLREDUCE**: Collective communication kernel marking tensor-parallel synchronization points.
-
-## Debugging Trace Analysis Issues
-
-If the user reports issues with trace analysis or wants to add support for a new model, refer to the detailed guide:
-- Read `/home/yichiche/agent-box/profile/trace-analyzer.md` for pattern table update instructions
-- Read `/home/yichiche/agent-box/profile/tests/README.md` for testing procedures
-
-When modifying `trace_analyzer.py`, always run the test suite:
-```bash
-cd /home/yichiche/agent-box/profile && python -m pytest tests/ -v
-```
-
-## Important Notes
-
-- Profile Excel files can be large (1+ MB with 20,000+ layer sheets). Read selectively — start with the Summary sheet, then drill into specific layers.
-- Raw trace files are very large (30-100+ MB compressed). Do NOT attempt to read them directly. Use `trace_analyzer.py` to process them.
-- When comparing versions, use `compare_traces.py` rather than manual diff — it handles layer matching, length-mismatch filtering, and confidence scoring.
-- The evaluation score uses 85 as the default pass threshold. Scores below this indicate structural parsing issues that need investigation.
 
 If the user provided `$ARGUMENTS`, treat it as their specific question or the path to profiling data to analyze.
