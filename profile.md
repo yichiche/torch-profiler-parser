@@ -4,7 +4,7 @@ You are an expert at analyzing SGLang GPU profiling data. Use this guide to unde
 
 ## Profiling Toolchain Overview
 
-The profiling tools live in `/home/yichiche/agent-box/profile/`. The primary tool is `trace_module_analyzer.py`, which uses nn.Module correlation to classify GPU kernels by their owning module rather than regex pattern matching.
+The primary tool is `trace_module_analyzer.py`, which uses nn.Module correlation to classify GPU kernels by their owning module rather than regex pattern matching.
 
 ```
 Raw Trace (.trace.json.gz)
@@ -24,22 +24,22 @@ Correlation-based GPU kernel classification using nn.Module hierarchy from PyTor
 
 ```bash
 # Basic analysis
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz -o report.xlsx
+python3trace_module_analyzer.py trace.json.gz -o report.xlsx
 
 # Enrich with HuggingFace config (adds head counts, vocab size, expert config)
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz -o report.xlsx --config config.json
+python3trace_module_analyzer.py trace.json.gz -o report.xlsx --config config.json
 
 # Show kernel-by-kernel detail for a specific module type
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock
+python3trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock
 
 # Show specific instance
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --detail-instance 5
+python3trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --detail-instance 5
 
 # Show full module tree
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --show-tree
+python3trace_module_analyzer.py trace.json.gz --show-tree
 
 # Disable automatic ROCm trace fix
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz --no-rocm-fix
+python3trace_module_analyzer.py trace.json.gz --no-rocm-fix
 ```
 
 ### fix_rocm_trace_flow.py — ROCm Trace Fix
@@ -47,8 +47,8 @@ python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py trace.json.gz 
 Fixes missing CUDA-graph flow events in ROCm/MI355 traces. Automatically applied by `trace_module_analyzer.py` unless `--no-rocm-fix` is passed. Can also be used standalone:
 
 ```bash
-python3 /home/yichiche/agent-box/profile/fix_rocm_trace_flow.py trace.json.gz -o trace_fixed.json.gz
-python3 /home/yichiche/agent-box/profile/fix_rocm_trace_flow.py trace.json.gz --in-place
+python3fix_rocm_trace_flow.py trace.json.gz -o trace_fixed.json.gz
+python3fix_rocm_trace_flow.py trace.json.gz --in-place
 ```
 
 ### model_inspector.py — Model Structure Inspector
@@ -57,17 +57,17 @@ Static model structure analysis from Python source code, plus trace-based archit
 
 ```bash
 # List classes in a model file
-python3 /home/yichiche/agent-box/profile/model_inspector.py deepseek_v2.py --list-classes
+python3model_inspector.py deepseek_v2.py --list-classes
 
 # Show module hierarchy tree
-python3 /home/yichiche/agent-box/profile/model_inspector.py deepseek_v2.py --root DeepseekV2ForCausalLM
+python3model_inspector.py deepseek_v2.py --root DeepseekV2ForCausalLM
 
 # PyTorch-profiler-style tree with layer instances expanded
-python3 /home/yichiche/agent-box/profile/model_inspector.py deepseek_v2.py --profiler-tree --config config.json
+python3model_inspector.py deepseek_v2.py --profiler-tree --config config.json
 
 # Generate architecture block diagram from a trace file
-python3 /home/yichiche/agent-box/profile/model_inspector.py --trace trace.json.gz --arch-diagram
-python3 /home/yichiche/agent-box/profile/model_inspector.py --trace trace.json.gz --arch-diagram --detailed
+python3model_inspector.py --trace trace.json.gz --arch-diagram
+python3model_inspector.py --trace trace.json.gz --arch-diagram --detailed
 ```
 
 ### evaluate_module_parsing.py — Quality Evaluator
@@ -75,7 +75,7 @@ python3 /home/yichiche/agent-box/profile/model_inspector.py --trace trace.json.g
 Evaluates the output of `trace_module_analyzer.py`. Used by the perf-regression pipeline for quality gating.
 
 ```bash
-python3 /home/yichiche/agent-box/profile/evaluate_module_parsing.py report.xlsx --json
+python3evaluate_module_parsing.py report.xlsx --json
 ```
 
 ## Output File Formats
@@ -126,7 +126,7 @@ Within a run directory, profiling outputs are in the `trace_analysis/` subdirect
 
 For new analysis, use `trace_module_analyzer.py`:
 ```bash
-python3 /home/yichiche/agent-box/profile/trace_module_analyzer.py /path/to/trace.json.gz -o report.xlsx -v
+python3trace_module_analyzer.py /path/to/trace.json.gz -o report.xlsx -v
 ```
 
 For existing analysis, read the `analysis.xlsx` and `evaluation.json` files in the `trace_analysis/` subdirectory.
