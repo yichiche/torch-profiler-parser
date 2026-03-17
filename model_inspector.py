@@ -1132,6 +1132,1013 @@ class ArchTemplate:
 
 
 # ---------------------------------------------------------------------------
+# Auto-generation helpers: trace + source + config -> ArchTemplate
+# ---------------------------------------------------------------------------
+
+# Module types that are infrastructure / not architecturally meaningful
+_INFRASTRUCTURE_TYPES = frozenset({
+    "AddAuxiliaryLoss", "LayerCommunicator", "CudaGraphReplay",
+})
+
+
+def _find_model_source(module_type: str,
+                       sglang_path: str = "/sgl-workspace/sglang",
+                       ) -> Optional[str]:
+    """Search sglang model files for a class matching *module_type*.
+
+    Returns the file path or None.
+    """
+    import glob as glob_mod
+    models_dir = os.path.join(sglang_path, "python", "sglang", "srt", "models")
+    if not os.path.isdir(models_dir):
+        return None
+
+    pattern = os.path.join(models_dir, "*.py")
+    candidates: List[Tuple[int, str]] = []  # (score, path)
+    class_re = re.compile(rf"^class\s+{re.escape(module_type)}\b", re.MULTILINE)
+
+    for fpath in sorted(glob_mod.glob(pattern)):
+        basename = os.path.basename(fpath)
+        # Penalise eagle / torch_native / nextn variants
+        penalty = 0
+        for tag in ("eagle", "torch_native", "nextn"):
+            if tag in basename:
+                penalty += 10
+
+        try:
+            with open(fpath, "r") as f:
+                src = f.read()
+        except OSError:
+            continue
+
+        if class_re.search(src):
+            # Bonus: file also has a ForCausalLM class
+            bonus = 5 if re.search(r"class\s+\w+ForCausalLM\b", src) else 0
+            score = bonus - penalty
+            candidates.append((score, fpath))
+
+    # Also try stripping common suffixes to widen the search
+    if not candidates:
+        alt_names = []
+        for suffix in ("Model", "ForCausalLM"):
+            if module_type.endswith(suffix):
+                base = module_type[: -len(suffix)]
+                alt_names.append(base + "ForCausalLM")
+                alt_names.append(base + "Model")
+        for alt in alt_names:
+            if alt == module_type:
+                continue
+            alt_re = re.compile(rf"^class\s+{re.escape(alt)}\b", re.MULTILINE)
+            for fpath in sorted(glob_mod.glob(pattern)):
+                basename = os.path.basename(fpath)
+                penalty = 0
+                for tag in ("eagle", "torch_native", "nextn"):
+                    if tag in basename:
+                        penalty += 10
+                try:
+                    with open(fpath, "r") as f:
+                        src = f.read()
+                except OSError:
+                    continue
+                if alt_re.search(src):
+                    bonus = 5 if re.search(r"class\s+\w+ForCausalLM\b", src) else 0
+                    candidates.append((bonus - penalty, fpath))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[0][1]
+
+
+_HUMANIZE_MAP = {
+    "MLA": "Multi-head Latent Attention",
+    "RMSNorm": "RMSNorm",
+    "LayerNorm": "LayerNorm",
+    "FusedMoE": "MoE Expert Pool",
+    "MLP": "Dense FFN",
+    "GatedMLP": "Dense FFN",
+    "SiluAndMul": "SiLU Activation",
+    "MoEGate": "MoE Router",
+    "TopK": "MoE Router",
+}
+
+# Regex-based humanization for patterns like DeepseekV2AttentionMLA
+_HUMANIZE_PATTERNS = [
+    (re.compile(r"MLA", re.IGNORECASE), "Multi-head Latent Attention"),
+    (re.compile(r"CrossAttn|CrossAttention", re.IGNORECASE), "Cross-Attention"),
+    (re.compile(r"SelfAttn|SelfAttention", re.IGNORECASE), "Self-Attention"),
+    (re.compile(r"Attention|Attn|MultiHead", re.IGNORECASE), "Multi-head Attention"),
+]
+
+_HUMANIZE_CATEGORY_MAP = {
+    "embedding": "Token Embedding",
+    "lm_head": "Output Head (LM Head)",
+}
+
+
+def _humanize_module_type(module_type: str, category: str) -> str:
+    """Return a human-readable label for *module_type*."""
+    if module_type in _HUMANIZE_MAP:
+        return _HUMANIZE_MAP[module_type]
+    # Try regex patterns
+    for pattern, label in _HUMANIZE_PATTERNS:
+        if pattern.search(module_type):
+            return label
+    if category in _HUMANIZE_CATEGORY_MAP:
+        return _HUMANIZE_CATEGORY_MAP[category]
+    # Category-based defaults
+    if category == "ffn":
+        return "Dense FFN"
+    if category == "moe_router":
+        return "MoE Router"
+    # Fallback: keep module_type as-is
+    return module_type
+
+
+def _build_annotation(module_type: str, category: str,
+                      cfg: Dict[str, Any],
+                      trace_info: Optional[Dict[str, Any]] = None) -> str:
+    """Build a short annotation string based on *category*, *cfg*, and trace.
+
+    *trace_info* may contain keys extracted from the trace tree:
+      ``n_projections``: number of projection children (attention)
+      ``n_experts_trace``: expert count inferred from trace
+      ``grandchild_types``: list of grandchild module_type strings
+    """
+    hs = cfg.get("hidden_size", 0)
+    vs = cfg.get("vocab_size", 0)
+    nh = cfg.get("num_attention_heads", 0)
+    nkv = cfg.get("num_key_value_heads", nh)
+    inter = cfg.get("intermediate_size", 0)
+    moe_inter = cfg.get("moe_intermediate_size", 0)
+    n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+    n_shared = cfg.get("n_shared_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0)
+    ti = trace_info or {}
+
+    if category == "embedding":
+        parts = []
+        if hs:
+            parts.append(f"d = {hs:,}")
+        elif ti.get("embedding_dim"):
+            parts.append(f"d = {ti['embedding_dim']:,}")
+        if vs:
+            parts.append(f"vocab = {vs:,}")
+        elif ti.get("vocab_size_shard"):
+            parts.append(f"vocab = {ti['vocab_size_shard']:,}/shard")
+        return " \u00b7 ".join(parts)
+
+    if category == "attention":
+        ann = f"{nh} heads" if nh else ""
+        if nkv and nkv != nh and ann:
+            ann += f" / {nkv} KV heads"
+        # Trace-only enrichment: infer heads from attention kernel shapes
+        if not ann:
+            heads_shard = ti.get("num_heads_per_shard", 0)
+            if heads_shard:
+                parts = [f"{heads_shard} heads/shard"]
+                kv_heads_shard = ti.get("num_kv_heads_per_shard", 0)
+                if kv_heads_shard and kv_heads_shard != heads_shard:
+                    parts.append(f"{kv_heads_shard} KV heads/shard")
+                head_dim = ti.get("head_dim", 0)
+                qk_head_dim = ti.get("qk_head_dim", 0)
+                if qk_head_dim and head_dim and qk_head_dim != head_dim:
+                    # MLA-style: Q/K and V have different head dims
+                    parts.append(f"d_qk = {qk_head_dim}")
+                    parts.append(f"d_v = {head_dim}")
+                elif head_dim:
+                    parts.append(f"d_head = {head_dim}")
+                ann = " · ".join(parts)
+            else:
+                parts = []
+                n_proj = ti.get("n_projections", 0)
+                if n_proj:
+                    parts.append(f"{n_proj} projections")
+                h_shard = ti.get("hidden_size_shard", 0)
+                if h_shard:
+                    parts.append(f"d_out = {h_shard:,}/shard")
+                ann = " · ".join(parts)
+        return ann
+
+    if category == "ffn":
+        if inter:
+            return f"intermediate = {inter:,}"
+        # Trace-only: extract from shapes
+        gc_types = ti.get("grandchild_types", [])
+        has_swiglu = ti.get("has_swiglu", False) or any(
+            "Silu" in t or "SwiGLU" in t for t in gc_types
+        )
+        inter_shard = ti.get("intermediate_size_shard", 0)
+        parts = []
+        if has_swiglu:
+            parts.append("SwiGLU")
+        if inter_shard:
+            parts.append(f"intermediate = {inter_shard:,}/shard")
+        return " · ".join(parts) if parts else ""
+
+    if category == "moe_router":
+        ann = f"Top-{top_k} of {n_routed} routed" if top_k and n_routed else ""
+        if n_shared:
+            ann += f" + {n_shared} shared"
+        # Trace-only: derive top_k and n_routed from shapes
+        if not ann:
+            trace_top_k = ti.get("top_k", 0)
+            trace_n_routed = ti.get("n_routed_experts", 0)
+            n_exp = ti.get("n_experts", 0)
+            if trace_top_k and trace_n_routed:
+                trace_n_shared = max(0, n_exp - trace_n_routed) if n_exp else 0
+                ann = f"Top-{trace_top_k} of {trace_n_routed} routed"
+                if trace_n_shared:
+                    ann += f" + {trace_n_shared} shared"
+            elif n_exp:
+                ann = f"{n_exp} experts"
+        return ann
+
+    if category == "expert_pool":
+        total = n_routed + n_shared
+        if not total:
+            total = ti.get("n_experts", 0) or ti.get("n_experts_trace", 0)
+        parts = []
+        if total:
+            parts.append(f"{total} experts")
+        if moe_inter:
+            parts.append(f"intermediate = {moe_inter:,}")
+        elif ti.get("moe_intermediate_size_shard"):
+            parts.append(f"inter = {ti['moe_intermediate_size_shard']:,}/shard")
+        return " \u00b7 ".join(parts)
+
+    if category == "lm_head":
+        if vs:
+            return f"vocab = {vs:,}"
+        v_shard = ti.get("vocab_size_shard", 0)
+        if v_shard:
+            return f"vocab = {v_shard:,}/shard"
+        return ""
+
+    return ""
+
+
+def _trace_layer_groups(raw_root):
+    """Split *raw_root.children* into header / decoder layers / footer.
+
+    Returns ``(header_children, layer_groups, footer_children)`` where
+    *layer_groups* is a list of
+    ``(layer_type, count, child_types, representative_children)`` tuples.
+    ``representative_children`` is the actual list of ModuleNode children
+    from one decoder layer in the group (for structural inspection).
+    """
+    children = list(raw_root.children) if hasattr(raw_root, "children") else []
+    if not children:
+        return ([], [], [])
+
+    # Count occurrences of each module_type
+    type_counts: Dict[str, int] = defaultdict(int)
+    for c in children:
+        type_counts[c.module_type] += 1
+
+    # The decoder layer type is the most-repeated child
+    if not type_counts:
+        return (children, [], [])
+    decoder_type = max(type_counts, key=lambda t: type_counts[t])
+    if type_counts[decoder_type] <= 1:
+        # No repeated type => no decoder layers detected
+        return (children, [], [])
+
+    # Split into header / decoder layers / footer
+    header = []
+    footer = []
+    decoder_layers = []
+    in_decoder = False
+    past_decoder = False
+    for c in children:
+        if c.module_type == decoder_type:
+            in_decoder = True
+            past_decoder = False
+            decoder_layers.append(c)
+        else:
+            if in_decoder:
+                in_decoder = False
+                past_decoder = True
+            if past_decoder:
+                footer.append(c)
+            else:
+                header.append(c)
+
+    # Group consecutive decoder layers by their child type signature
+    # Keep a representative layer per group for structural inspection
+    groups: List[Tuple[str, int, List[str], list]] = []
+    for dl in decoder_layers:
+        dl_children = list(getattr(dl, "children", []))
+        child_types = [gc.module_type for gc in dl_children]
+        sig = tuple(child_types)
+        if groups and groups[-1][0] == decoder_type and tuple(groups[-1][2]) == sig:
+            groups[-1] = (groups[-1][0], groups[-1][1] + 1, groups[-1][2],
+                          groups[-1][3])
+        else:
+            groups.append((decoder_type, 1, list(child_types), dl_children))
+
+    return (header, groups, footer)
+
+
+def _classify_group_label(child_types: List[str], count: int) -> str:
+    """Return a label like 'x3 Dense layers' or 'x58 MoE layers'."""
+    cats = {classify_module_category(t) for t in child_types}
+    if "moe_router" in cats or "expert_pool" in cats:
+        return f"\u00d7{count} MoE layers"
+    return f"\u00d7{count} Dense layers"
+
+
+def _extract_shapes_for_module(module_node, cpu_ops: list) -> Dict[str, Any]:
+    """Binary-search *cpu_ops* (sorted by ts) for ops inside *module_node*
+    and extract weight matrix dimensions.
+
+    Returns dict with optional keys:
+      hidden_size_shard, intermediate_size_shard, n_experts,
+      moe_intermediate_size_shard, n_routed_experts, top_k,
+      vocab_size_shard, embedding_dim
+    """
+    import bisect
+    if not cpu_ops or not hasattr(module_node, "ts"):
+        return {}
+
+    ts_start = module_node.ts
+    ts_end = module_node.end
+    # binary search for start
+    timestamps = [e.get("ts", 0) for e in cpu_ops]
+    lo = bisect.bisect_left(timestamps, ts_start)
+    hi = bisect.bisect_right(timestamps, ts_end)
+    if lo >= hi:
+        return {}
+
+    shapes: Dict[str, Any] = {}
+    # Collect weight-matrix dimensions from gemm / mm / linear ops.
+    weight_dims: List[Tuple[int, int]] = []  # (out, in) of each weight
+    token_dim = 0  # inferred batch*seq dimension
+    has_silu_and_mul = False  # merged gate+up detection
+    silu_output_dim = 0  # the true intermediate size from silu_and_mul output
+    moe_3d_dims: List[Tuple[int, int, int]] = []  # (n_experts, dim1, dim2)
+
+    for e in cpu_ops[lo:hi]:
+        name = e.get("name", "")
+        dims = e.get("args", {}).get("Input Dims", [])
+        name_lower = name.lower()
+
+        # Detect silu_and_mul (SwiGLU): output is half of input,
+        # giving us the true (non-merged) intermediate size
+        if "silu_and_mul" in name_lower:
+            has_silu_and_mul = True
+            for d in dims:
+                if isinstance(d, list) and len(d) == 2:
+                    # The smaller 2-D tensor is the output (true intermediate)
+                    if not silu_output_dim or d[1] < silu_output_dim:
+                        silu_output_dim = d[1]
+            continue
+
+        # Detect embedding ops: aten::embedding has [vocab_size, hidden_size]
+        if name_lower in ("aten::embedding",):
+            for d in dims:
+                if (isinstance(d, list) and len(d) == 2
+                        and all(isinstance(x, int) for x in d)
+                        and d[0] > 0 and d[1] > 0):
+                    shapes.setdefault("vocab_size_shard", d[0])
+                    shapes.setdefault("embedding_dim", d[1])
+            continue
+
+        # MoE gate ops: extract top_k from output tensor dimensions
+        # e.g. moe_fused_gate: input [tokens, n_routed], output [tokens, top_k]
+        if "moe" in name_lower and "gate" in name_lower:
+            twod = [d for d in dims
+                    if isinstance(d, list) and len(d) == 2
+                    and all(isinstance(x, int) for x in d)]
+            if len(twod) >= 2:
+                # First 2D is input [tokens, n_routed], subsequent are output [tokens, top_k]
+                gate_input = twod[0]
+                gate_output = twod[1]
+                if gate_input[1] > gate_output[1]:
+                    shapes.setdefault("n_routed_experts", gate_input[1])
+                    shapes.setdefault("top_k", gate_output[1])
+            continue
+
+        # MoE-specific ops: extract from 3-D weights
+        is_moe = any(kw in name_lower
+                     for kw in ("moe", "fused_moe", "ck_moe"))
+        if is_moe:
+            for d in dims:
+                if (isinstance(d, list) and len(d) == 3
+                        and all(isinstance(x, int) for x in d)
+                        and d[0] > 1 and d[0] < 10000):
+                    moe_3d_dims.append((d[0], d[1], d[2]))
+                    shapes.setdefault("n_experts", d[0])
+            continue
+
+        # Detect attention kernels: extract num_heads from 3-D Q/K/V tensors.
+        # Attention ops (FlashAttn, fmha, etc.) have shapes like
+        #   Q: [tokens, num_heads, qk_head_dim]
+        #   K: [tokens, num_kv_heads, qk_head_dim]
+        #   V: [tokens, num_kv_heads, v_head_dim]
+        # For MLA, qk_head_dim (e.g. 192) != v_head_dim (e.g. 128).
+        is_attn = any(kw in name_lower
+                      for kw in ("flash", "fmha", "attn", "attention",
+                                 "paged_attention", "sdpa"))
+        if is_attn:
+            threed = [d for d in dims
+                      if isinstance(d, list) and len(d) == 3
+                      and all(isinstance(x, int) for x in d)
+                      and d[1] > 0 and d[2] > 0
+                      and 1 <= d[1] <= 512 and 16 <= d[2] <= 512]
+            if threed:
+                # Q tensor is typically the first 3-D — its dim-1 is num_heads
+                shapes.setdefault("num_heads_per_shard", threed[0][1])
+                # Collect all distinct head_dims across Q/K/V tensors
+                head_dims = sorted(set(d[2] for d in threed))
+                # Use the smallest as representative v_head_dim
+                shapes.setdefault("head_dim", head_dims[0])
+                if len(head_dims) > 1:
+                    shapes.setdefault("qk_head_dim", head_dims[-1])
+                # If KV heads differ from Q heads, capture it
+                kv_heads_cands = sorted(set(d[1] for d in threed))
+                if len(kv_heads_cands) > 1:
+                    shapes.setdefault("num_kv_heads_per_shard",
+                                      min(kv_heads_cands))
+            continue
+
+        is_compute = any(kw in name_lower
+                         for kw in ("gemm", "mm", "linear"))
+        if not is_compute:
+            continue
+
+        twod = [d for d in dims
+                if isinstance(d, list) and len(d) == 2
+                and all(isinstance(x, int) for x in d)
+                and min(d) > 0]
+        if len(twod) >= 2:
+            inp, wt = twod[0], twod[1]
+            # The first 2-D tensor's dim-0 is the token/batch dimension
+            if not token_dim:
+                token_dim = inp[0]
+            # Weight is the tensor where neither dim equals the token count
+            if wt[0] != token_dim and wt[1] != token_dim:
+                weight_dims.append((wt[0], wt[1]))
+
+    # Process MoE 3D weights: find the true moe_intermediate_size
+    # Typical shapes:
+    #   gate+up weight: [n_experts, merged_inter, hidden_or_packed]
+    #   down weight:    [n_experts, hidden_size, inter_or_packed]
+    #   scale tensors:  [n_experts, dim, small_val]  (e.g. [257, 512, 224])
+    # Filter out scale/quantization tensors (dim2 < 256 or much smaller than dim1).
+    if moe_3d_dims:
+        # Keep only "real" weight tensors: both dim1 and dim2 should be
+        # reasonably large (> 256 each, or dim2 > dim1/8).
+        real_weights = [d for d in moe_3d_dims
+                        if d[1] >= 256 and d[2] >= 256]
+        if not real_weights:
+            # Fallback: just use all
+            real_weights = moe_3d_dims
+
+        # Find the two distinct dim1 values (hidden_size and intermediate)
+        distinct_dim1 = sorted(set(d[1] for d in real_weights))
+        if len(distinct_dim1) >= 2:
+            # The smaller dim1 is the intermediate (possibly merged gate+up)
+            smaller_dim1 = distinct_dim1[0]
+            larger_dim1 = distinct_dim1[-1]
+            # Check if smaller is merged (2x relationship)
+            if smaller_dim1 % 2 == 0 and larger_dim1 > smaller_dim1:
+                shapes["moe_intermediate_size_shard"] = smaller_dim1 // 2
+            else:
+                shapes["moe_intermediate_size_shard"] = smaller_dim1
+            shapes.setdefault("hidden_size_shard", larger_dim1)
+        elif len(distinct_dim1) == 1:
+            # Single dim1 value — check dim2 for differentiation
+            d1 = distinct_dim1[0]
+            if d1 % 2 == 0:
+                shapes["moe_intermediate_size_shard"] = d1 // 2
+            else:
+                shapes["moe_intermediate_size_shard"] = d1
+
+    if weight_dims:
+        in_features = [w[1] for w in weight_dims]
+        out_features = [w[0] for w in weight_dims]
+        # hidden_size appears as in-feature of one op and out-feature of another
+        in_set = set(in_features)
+        out_set = set(out_features)
+        shared = in_set & out_set
+        if shared:
+            shapes["hidden_size_shard"] = max(shared)
+
+        # For intermediate size: prefer silu_and_mul output dimension when available
+        # (it gives the true, un-merged intermediate size)
+        if silu_output_dim:
+            shapes["intermediate_size_shard"] = silu_output_dim
+        else:
+            hs = shapes.get("hidden_size_shard", 0)
+            non_hs = [o for o in out_features if o != hs and o > 0]
+            if non_hs:
+                shapes["intermediate_size_shard"] = max(non_hs)
+
+    if has_silu_and_mul:
+        shapes["has_swiglu"] = True
+
+    return shapes
+
+
+def _extract_trace_info(trace_child, cpu_ops: Optional[list] = None,
+                        ) -> Dict[str, Any]:
+    """Extract structural info from a trace ModuleNode's grandchildren
+    and, optionally, from cpu_op shapes within the module's time span."""
+    info: Dict[str, Any] = {}
+    gc_list = list(getattr(trace_child, "children", []))
+    gc_types = [gc.module_type for gc in gc_list]
+    info["grandchild_types"] = gc_types
+
+    # Count projection-like grandchildren
+    n_proj = sum(
+        1 for t in gc_types
+        if classify_module_category(t) == "projection"
+    )
+    if n_proj:
+        info["n_projections"] = n_proj
+
+    # Count expert-pool grandchildren (for expert_pool parents).
+    # FusedMoE is a single fused kernel that bundles all experts, so
+    # a count of 1 is not meaningful — only trust counts > 1.
+    n_exp = sum(
+        1 for t in gc_types
+        if classify_module_category(t) == "expert_pool"
+    )
+    if n_exp > 1:
+        info["n_experts_trace"] = n_exp
+
+    # Extract shapes from cpu_ops if available
+    if cpu_ops:
+        shapes = _extract_shapes_for_module(trace_child, cpu_ops)
+        info.update(shapes)
+
+    return info
+
+
+def _children_to_blocks(child_types: List[str],
+                        cfg: Dict[str, Any],
+                        trace_children: Optional[list] = None,
+                        cpu_ops: Optional[list] = None,
+                        ) -> List[SemanticBlock]:
+    """Convert trace child module_type names to SemanticBlock list.
+
+    *trace_children* is an optional list of actual trace ModuleNode objects
+    (aligned 1:1 with *child_types*) used to extract structural info
+    (projection counts, expert counts, etc.) when config is absent.
+    *cpu_ops* is an optional sorted list of cpu_op events for shape extraction.
+    """
+    hs = cfg.get("hidden_size", 0)
+    moe_inter = cfg.get("moe_intermediate_size", 0)
+    n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+    n_shared = cfg.get("n_shared_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0)
+
+    # Track whether we already emitted a router block
+    emitted_router = False
+    # Track whether we already emitted an expert grid
+    emitted_expert = False
+
+    blocks: List[SemanticBlock] = []
+    for idx, mt in enumerate(child_types):
+        if mt in _INFRASTRUCTURE_TYPES:
+            continue
+        cat = classify_module_category(mt)
+        label = _humanize_module_type(mt, cat)
+
+        # Extract structural info from trace grandchildren + cpu_op shapes
+        ti: Dict[str, Any] = {}
+        if trace_children and idx < len(trace_children):
+            ti = _extract_trace_info(trace_children[idx], cpu_ops=cpu_ops)
+
+        ann = _build_annotation(mt, cat, cfg, trace_info=ti)
+
+        # Append original module type when the label was humanized
+        if label != mt and cat not in ("norm",):
+            if ann:
+                ann += f"  ({mt})"
+            else:
+                ann = mt
+
+        if cat == "moe_router":
+            if not emitted_router:
+                blocks.append(SemanticBlock(
+                    label="MoE Router", category="moe_router",
+                    annotation=ann,
+                ))
+                emitted_router = True
+            continue
+
+        if cat == "expert_pool":
+            if emitted_expert:
+                continue
+            emitted_expert = True
+
+            # If no explicit router was emitted yet, add one before the grid
+            if not emitted_router:
+                router_ann = _build_annotation(mt, "moe_router", cfg,
+                                               trace_info=ti)
+                if router_ann:
+                    router_ann += f"  ({mt})"
+                else:
+                    router_ann = mt
+                blocks.append(SemanticBlock(
+                    label="MoE Router", category="moe_router",
+                    annotation=router_ann,
+                ))
+                emitted_router = True
+
+            expert_total = n_routed + n_shared
+            if not expert_total:
+                expert_total = (ti.get("n_experts", 0)
+                                or ti.get("n_experts_trace", 0))
+            expert_grid = SemanticBlock(
+                label="", category="expert_pool", layout="expert_grid",
+                expert_count=expert_total, expert_display=6,
+            )
+            # Expert FFN projection annotations — use config or trace shapes
+            moe_proj_ann = f"\u2192 {moe_inter:,}" if moe_inter else ""
+            if not moe_proj_ann and ti.get("moe_intermediate_size_shard"):
+                moe_proj_ann = f"\u2192 {ti['moe_intermediate_size_shard']:,}/shard"
+            down_ann = f"\u2192 {hs:,}" if hs else ""
+            if not down_ann and ti.get("hidden_size_shard"):
+                down_ann = f"\u2192 {ti['hidden_size_shard']:,}/shard"
+
+            expert_ffn = SemanticBlock(
+                label="EXPERT FFN (SwiGLU)", category="expert_pool",
+                layout="vertical",
+                children=[
+                    SemanticBlock(
+                        label="", category="projection", layout="parallel",
+                        children=[
+                            SemanticBlock(
+                                label="Gate Projection", category="projection",
+                                annotation=moe_proj_ann,
+                                width_fraction=0.48,
+                            ),
+                            SemanticBlock(
+                                label="Up Projection", category="projection",
+                                annotation=moe_proj_ann,
+                                width_fraction=0.48,
+                            ),
+                        ],
+                    ),
+                    SemanticBlock(
+                        label="SiLU Activation", category="activation",
+                        annotation="Applied to gate", width_fraction=0.48,
+                    ),
+                    SemanticBlock(
+                        label="Down Projection", category="projection",
+                        annotation=down_ann,
+                        residual_after=True,
+                    ),
+                ],
+            )
+            blocks.append(expert_grid)
+            blocks.append(expert_ffn)
+            continue
+
+        residual = cat in ("attention", "ffn")
+        blocks.append(SemanticBlock(
+            label=label, category=cat, annotation=ann,
+            residual_after=residual,
+        ))
+
+    # Synthesise pre-attention RMSNorm if missing.
+    # In pre-norm transformers the input_layernorm precedes attention, but it
+    # may be absent from the trace when it is fused into a combined kernel
+    # (e.g. fused_rms_mxfp4_quant on MI300/MI355) or called by a non-Module
+    # helper like LayerCommunicator.  Detect the gap: if the first semantic
+    # block is attention (no preceding norm), insert a synthesised norm.
+    if blocks and blocks[0].category == "attention":
+        blocks.insert(0, SemanticBlock(
+            label="RMSNorm", category="norm",
+            annotation="fused / not in trace",
+        ))
+
+    return blocks
+
+
+def _compute_subtitle(cfg: Dict[str, Any]) -> str:
+    """Compute subtitle like '671B total · 37B active · 128K context'."""
+    hs = cfg.get("hidden_size", 0)
+    vs = cfg.get("vocab_size", 0)
+    inter = cfg.get("intermediate_size", 0)
+    moe_inter = cfg.get("moe_intermediate_size", 0)
+    n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+    n_shared = cfg.get("n_shared_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0)
+    first_k = cfg.get("first_k_dense_replace", 0)
+    total_layers = cfg.get("num_hidden_layers", 0)
+    max_pos = cfg.get("max_position_embeddings", 0)
+
+    params_b = 0.0
+    if hs and total_layers:
+        attn_params = 4 * hs * hs
+        ffn_params = 3 * hs * inter if inter else 0
+        moe_ffn_params = (
+            n_routed * 3 * hs * moe_inter if n_routed and moe_inter else 0
+        )
+        shared_ffn_params = (
+            n_shared * 3 * hs * moe_inter if n_shared and moe_inter else 0
+        )
+        dense_layer_params = attn_params + ffn_params
+        moe_layer_params = attn_params + moe_ffn_params + shared_ffn_params
+        total_params = (
+            first_k * dense_layer_params
+            + (total_layers - first_k) * moe_layer_params
+        )
+        total_params += vs * hs
+        params_b = total_params / 1e9
+
+    active_b = 0.0
+    if params_b and n_routed and top_k:
+        active_per_expert = 3 * hs * moe_inter if moe_inter else 0
+        moe_active_ffn = top_k * active_per_expert + n_shared * active_per_expert
+        attn_params = 4 * hs * hs
+        dense_ffn = 3 * hs * inter if inter else 0
+        active_per_layer = attn_params + moe_active_ffn
+        dense_per_layer = attn_params + dense_ffn
+        total_active = (
+            first_k * dense_per_layer
+            + (total_layers - first_k) * active_per_layer
+        )
+        total_active += vs * hs
+        active_b = total_active / 1e9
+
+    context_k = max_pos // 1000 if max_pos else 0
+    parts = []
+    if params_b > 0:
+        parts.append(f"{params_b:.0f}B total")
+    if active_b > 0:
+        parts.append(f"{active_b:.0f}B active")
+    if context_k:
+        parts.append(f"{context_k}K context")
+    return " \u00b7 ".join(parts)
+
+
+def _compute_metadata(cfg: Dict[str, Any],
+                      layer_groups: List[Tuple[str, int, List[str]]],
+                      trace_child_types: set,
+                      trace_shapes: Optional[Dict[str, Any]] = None,
+                      ) -> Dict[str, str]:
+    """Build the metadata footer dict from config and layer group info.
+
+    *trace_shapes* may contain keys extracted from trace cpu_ops:
+      n_routed_experts, top_k, n_experts (used when config is absent).
+    """
+    kv_lora = cfg.get("kv_lora_rank")
+    n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+    n_shared = cfg.get("n_shared_experts", 0)
+    top_k = cfg.get("num_experts_per_tok", 0)
+    max_pos = cfg.get("max_position_embeddings", 0)
+    total_layers = cfg.get("num_hidden_layers", 0)
+    first_k = cfg.get("first_k_dense_replace", 0)
+    ts = trace_shapes or {}
+
+    is_mla = (kv_lora is not None and kv_lora > 0) or any(
+        "MLA" in t for t in trace_child_types
+    )
+    has_moe = n_routed > 0 or any(
+        "MoE" in t or "FusedMoE" in t or "Expert" in t
+        for t in trace_child_types
+    )
+    context_k = max_pos // 1000 if max_pos else 0
+
+    # Count dense / moe layers from the groups
+    dense_count = 0
+    moe_count = 0
+    for grp in layer_groups:
+        # Support both 3-tuple and 4-tuple (with representative children)
+        _, cnt, child_types = grp[0], grp[1], grp[2]
+        cats = {classify_module_category(t) for t in child_types}
+        if "moe_router" in cats or "expert_pool" in cats:
+            moe_count += cnt
+        else:
+            dense_count += cnt
+
+    # Fallback to config if trace didn't reveal groups
+    if not layer_groups and total_layers:
+        if has_moe and first_k:
+            dense_count = first_k
+            moe_count = total_layers - first_k
+        elif has_moe:
+            moe_count = total_layers
+        else:
+            dense_count = total_layers
+
+    meta: Dict[str, str] = {}
+    meta["Type"] = "MoE" if has_moe else "Dense"
+    if dense_count and moe_count:
+        meta["Layers"] = f"{dense_count}D+{moe_count}M"
+    elif total_layers:
+        meta["Layers"] = str(total_layers)
+    meta["Attention"] = "MLA" if is_mla else "MHA"
+    if context_k:
+        meta["Context"] = f"{context_k}K"
+    if n_routed:
+        meta["Experts"] = f"{top_k}/{n_routed + n_shared}"
+    elif has_moe:
+        # Try trace-derived expert info
+        t_top_k = ts.get("top_k", 0)
+        t_n_routed = ts.get("n_routed_experts", 0)
+        t_n_experts = ts.get("n_experts", 0)
+        if t_top_k and t_n_routed:
+            meta["Experts"] = f"{t_top_k}/{t_n_experts or t_n_routed}"
+        elif t_n_experts:
+            meta["Experts"] = f"{t_n_experts}"
+        else:
+            meta["Experts"] = "MoE"
+
+    return meta
+
+
+def module_tree_to_arch_template(raw_root, classes, cfg,
+                                 cpu_ops: Optional[list] = None,
+                                 ) -> ArchTemplate:
+    """Auto-generate an ArchTemplate from trace tree + parsed classes + config.
+
+    This is the main orchestrator: it analyses the trace tree structure,
+    classifies layers, and builds the complete template without any
+    model-specific hardcoding.
+
+    *cpu_ops* is an optional sorted list of cpu_op events (with ``Input Dims``)
+    for extracting tensor shapes when config is not available.
+    """
+    if cfg is None:
+        cfg = {}
+
+    # Derive title from config or root module_type
+    root_type = raw_root.module_type if raw_root else "Model"
+    archs = cfg.get("architectures", [])
+    if archs:
+        title = archs[0].replace("ForCausalLM", "").replace("ForConditionalGeneration", "")
+        # Clean up: "DeepseekV3" -> "DeepSeek", etc.  Keep it short.
+        title = re.sub(r"(V\d+)$", "", title)  # strip version suffix
+        title = re.sub(r"([a-z])([A-Z])", r"\1 \2", title)  # CamelCase -> spaces
+        title = re.sub(r"^Deepseek$", "DeepSeek", title)  # capitalisation fix
+    else:
+        title = root_type
+
+    subtitle = _compute_subtitle(cfg)
+
+    # Collect all child types seen anywhere in trace (for metadata detection)
+    trace_child_types: set = set()
+    if raw_root and hasattr(raw_root, "children"):
+        for child in raw_root.children:
+            trace_child_types.add(child.module_type)
+            for gc in getattr(child, "children", []):
+                trace_child_types.add(gc.module_type)
+
+    # Split trace tree into header / decoder-layer groups / footer
+    header_children, layer_groups_raw, footer_children = _trace_layer_groups(
+        raw_root
+    )
+
+    # Try to extract vocab_size / hidden_size from source code config_accesses
+    # when config is empty
+    _src_cfg_keys: set = set()
+    if classes:
+        for cls_info in classes.values():
+            for acc in getattr(cls_info, "config_accesses", []):
+                _src_cfg_keys.add(acc)
+
+    # Build header blocks; also collect embedding shapes for LM head reuse
+    header_blocks: List[SemanticBlock] = []
+    _embedding_trace_info: Dict[str, Any] = {}
+    for hc in header_children:
+        cat = classify_module_category(hc.module_type)
+        label = _humanize_module_type(hc.module_type, cat)
+        ti: Dict[str, Any] = {}
+        if cpu_ops:
+            ti = _extract_trace_info(hc, cpu_ops=cpu_ops)
+            # For embedding, also extract shapes directly from the module
+            if cat == "embedding":
+                shapes = _extract_shapes_for_module(hc, cpu_ops)
+                ti.update(shapes)
+                _embedding_trace_info = ti
+        ann = _build_annotation(hc.module_type, cat, cfg, trace_info=ti)
+        # Append original module type when humanized
+        if label != hc.module_type and cat not in ("norm",):
+            if ann:
+                ann += f"  ({hc.module_type})"
+            else:
+                ann = hc.module_type
+        header_blocks.append(SemanticBlock(label=label, category=cat, annotation=ann))
+
+    # If no header from trace but config has vocab info, synthesise embedding
+    if not header_blocks:
+        hs = cfg.get("hidden_size", 0)
+        vs = cfg.get("vocab_size", 0)
+        parts = []
+        if hs:
+            parts.append(f"d = {hs:,}")
+        if vs:
+            parts.append(f"vocab = {vs:,}")
+        header_blocks.append(SemanticBlock(
+            label="Token Embedding", category="embedding",
+            annotation=" \u00b7 ".join(parts),
+        ))
+
+    # Build layer groups
+    layer_group_defs: List[LayerGroupDef] = []
+    for layer_type, count, child_types, repr_children in layer_groups_raw:
+        group_label = _classify_group_label(child_types, count)
+        blocks = _children_to_blocks(child_types, cfg,
+                                     trace_children=repr_children,
+                                     cpu_ops=cpu_ops)
+        layer_group_defs.append(LayerGroupDef(
+            count=count, label=group_label, blocks=blocks,
+        ))
+
+    # Fallback: use config-derived layer groups when trace has none
+    if not layer_group_defs:
+        total_layers = cfg.get("num_hidden_layers", 0)
+        first_k = cfg.get("first_k_dense_replace", 0)
+        n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+        has_moe = n_routed > 0 or any(
+            "MoE" in t or "FusedMoE" in t for t in trace_child_types
+        )
+        if total_layers:
+            if has_moe and first_k:
+                layer_group_defs.append(LayerGroupDef(
+                    count=first_k,
+                    label=f"\u00d7{first_k} Dense layers",
+                    blocks=[],
+                ))
+                moe_count = total_layers - first_k
+                layer_group_defs.append(LayerGroupDef(
+                    count=moe_count,
+                    label=f"\u00d7{moe_count} MoE layers",
+                    blocks=[],
+                ))
+            elif has_moe:
+                layer_group_defs.append(LayerGroupDef(
+                    count=total_layers,
+                    label=f"\u00d7{total_layers} MoE layers",
+                    blocks=[],
+                ))
+            else:
+                layer_group_defs.append(LayerGroupDef(
+                    count=total_layers,
+                    label=f"\u00d7{total_layers} layers",
+                    blocks=[],
+                ))
+
+    # Build footer blocks
+    footer_blocks: List[SemanticBlock] = []
+    for fc in footer_children:
+        cat = classify_module_category(fc.module_type)
+        label = _humanize_module_type(fc.module_type, cat)
+        ann = _build_annotation(fc.module_type, cat, cfg)
+        footer_blocks.append(SemanticBlock(label=label, category=cat, annotation=ann))
+
+    # If no footer from trace, synthesise norm + LM head
+    if not footer_blocks:
+        footer_blocks.append(SemanticBlock(label="RMSNorm", category="norm"))
+
+    # If footer has no LM head, append one (trace usually doesn't capture it)
+    has_lm_head = any(b.category == "lm_head" for b in footer_blocks)
+    if not has_lm_head:
+        vs = cfg.get("vocab_size", 0)
+        lm_ann = f"vocab = {vs:,}" if vs else ""
+        # Trace-only: reuse vocab_size_shard from embedding extraction
+        if not lm_ann and _embedding_trace_info.get("vocab_size_shard"):
+            lm_ann = f"vocab = {_embedding_trace_info['vocab_size_shard']:,}/shard"
+        footer_blocks.append(SemanticBlock(
+            label="Output Head (LM Head)", category="lm_head",
+            annotation=lm_ann,
+        ))
+
+    # Collect trace-derived MoE shapes for metadata (top_k, n_routed, n_experts)
+    _moe_trace_shapes: Dict[str, Any] = {}
+    if cpu_ops:
+        for _lt, _cnt, _cts, _repr_ch in layer_groups_raw:
+            cats = {classify_module_category(t) for t in _cts}
+            if "moe_router" not in cats and "expert_pool" not in cats:
+                continue
+            for ch in _repr_ch:
+                ti = _extract_trace_info(ch, cpu_ops=cpu_ops)
+                for key in ("top_k", "n_routed_experts", "n_experts"):
+                    if ti.get(key) and key not in _moe_trace_shapes:
+                        _moe_trace_shapes[key] = ti[key]
+            if _moe_trace_shapes:
+                break
+
+    metadata = _compute_metadata(cfg, layer_groups_raw, trace_child_types,
+                                 trace_shapes=_moe_trace_shapes)
+
+    return ArchTemplate(
+        title=title,
+        subtitle=subtitle,
+        header_blocks=header_blocks,
+        layer_groups=layer_group_defs,
+        footer_blocks=footer_blocks,
+        metadata=metadata,
+    )
+
+
+# ---------------------------------------------------------------------------
 # TraceHierarchyExtractor (kept for fallback / raw tree)
 # ---------------------------------------------------------------------------
 
@@ -1173,6 +2180,14 @@ class TraceHierarchyExtractor:
 
     def extract_raw_root(self):
         """Return the raw ModuleNode root (for template matching)."""
+        root, _ = self._extract_raw(with_cpu_ops=False)
+        return root
+
+    def extract_raw_root_with_ops(self):
+        """Return (raw_root, cpu_op_events) for shape extraction."""
+        return self._extract_raw(with_cpu_ops=True)
+
+    def _extract_raw(self, with_cpu_ops=False):
         from trace_module_analyzer import ModuleTreeBuilder, TraceModuleAnalyzer
 
         data = TraceModuleAnalyzer._load_trace(self.trace_path)
@@ -1187,8 +2202,21 @@ class TraceHierarchyExtractor:
         builder = ModuleTreeBuilder()
         roots = builder.build_from_module_events(module_events)
         if not roots:
-            return None
-        return max(roots, key=lambda r: r.end - r.ts)
+            return None, []
+        best_root = max(roots, key=lambda r: r.end - r.ts)
+
+        cpu_ops = []
+        if with_cpu_ops:
+            # Collect events with Input Dims on the same thread
+            target_tid = best_root.tid
+            cpu_ops = [
+                e for e in events
+                if e.get("tid") == target_tid
+                and "Input Dims" in e.get("args", {})
+            ]
+            cpu_ops.sort(key=lambda e: e.get("ts", 0))
+
+        return best_root, cpu_ops
 
     def _deduplicate(self, node) -> ArchNode:
         category = classify_module_category(node.module_type)
@@ -1210,284 +2238,6 @@ class TraceHierarchyExtractor:
             child_arch.count = len(members)
             arch.children.append(child_arch)
         return arch
-
-
-# ---------------------------------------------------------------------------
-# Template: DeepSeek V2/V3 MoE
-# ---------------------------------------------------------------------------
-
-def _build_deepseek_template(cfg: Dict[str, Any], root_type: str,
-                             raw_root=None) -> ArchTemplate:
-    hs = cfg.get("hidden_size", 0)
-    vs = cfg.get("vocab_size", 0)
-    nh = cfg.get("num_attention_heads", 0)
-    nkv = cfg.get("num_key_value_heads", nh)
-    kv_lora = cfg.get("kv_lora_rank")
-    inter = cfg.get("intermediate_size", 0)
-    moe_inter = cfg.get("moe_intermediate_size", 0)
-    n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
-    n_shared = cfg.get("n_shared_experts", 0)
-    top_k = cfg.get("num_experts_per_tok", 0)
-    first_k = cfg.get("first_k_dense_replace", 0)
-    total_layers = cfg.get("num_hidden_layers", 0)
-    max_pos = cfg.get("max_position_embeddings", 0)
-
-    # When config is missing/empty, derive what we can from the trace tree
-    _trace_child_types = set()
-    if raw_root and hasattr(raw_root, "children"):
-        for child in raw_root.children:
-            _trace_child_types.add(child.module_type)
-            if not total_layers and "DecoderLayer" in child.module_type:
-                total_layers = sum(
-                    1 for c in raw_root.children
-                    if c.module_type == child.module_type
-                )
-            for gc in getattr(child, "children", []):
-                _trace_child_types.add(gc.module_type)
-
-    is_mla = kv_lora is not None and kv_lora > 0
-    if not is_mla and any("MLA" in t for t in _trace_child_types):
-        is_mla = True
-    has_moe_in_trace = any(
-        "MoE" in t or "FusedMoE" in t or "Expert" in t
-        for t in _trace_child_types
-    )
-
-    attn_label = "Multi-head Latent Attention" if is_mla else "Multi-head Attention"
-    attn_ann = f"{nh} heads" if nh else ""
-    if nkv and nkv != nh:
-        attn_ann += f" / {nkv} KV heads"
-
-    model_name = "DeepSeek"
-    archs = cfg.get("architectures", [])
-    if archs:
-        name = archs[0].replace("ForCausalLM", "")
-        if "V3" in name or "v3" in root_type:
-            model_name = "DeepSeek-V3"
-        elif "V2" in name or "v2" in root_type.lower():
-            model_name = "DeepSeek-V2"
-    elif "v3" in root_type.lower():
-        model_name = "DeepSeek-V3"
-    elif "v2" in root_type.lower():
-        model_name = "DeepSeek-V2"
-
-    # Compute parameter estimate
-    params_b = 0
-    if hs and total_layers:
-        attn_params = 4 * hs * hs
-        ffn_params = 3 * hs * inter if inter else 0
-        moe_ffn_params = n_routed * 3 * hs * moe_inter if n_routed and moe_inter else 0
-        shared_ffn_params = n_shared * 3 * hs * moe_inter if n_shared and moe_inter else 0
-        dense_layer_params = attn_params + ffn_params
-        moe_layer_params = attn_params + moe_ffn_params + shared_ffn_params
-        total_params = first_k * dense_layer_params + (total_layers - first_k) * moe_layer_params
-        total_params += vs * hs  # embedding
-        params_b = total_params / 1e9
-
-    active_b = 0
-    if params_b and n_routed and top_k:
-        active_per_expert = 3 * hs * moe_inter if moe_inter else 0
-        moe_active_ffn = top_k * active_per_expert + n_shared * active_per_expert
-        attn_params = 4 * hs * hs
-        dense_ffn = 3 * hs * inter if inter else 0
-        active_per_layer = attn_params + moe_active_ffn
-        dense_per_layer = attn_params + dense_ffn
-        total_active = first_k * dense_per_layer + (total_layers - first_k) * active_per_layer
-        total_active += vs * hs
-        active_b = total_active / 1e9
-
-    context_k = max_pos // 1000 if max_pos else 0
-    subtitle_parts = []
-    if params_b > 0:
-        subtitle_parts.append(f"{params_b:.0f}B total")
-    if active_b > 0:
-        subtitle_parts.append(f"{active_b:.0f}B active")
-    if context_k:
-        subtitle_parts.append(f"{context_k}K context")
-    subtitle = " · ".join(subtitle_parts)
-
-    embed_ann = ""
-    if hs:
-        embed_ann += f"d = {hs:,}"
-    if vs:
-        embed_ann += f" \u00b7 vocab = {vs:,}"
-
-    # Dense layer blocks
-    dense_blocks = [
-        SemanticBlock(label="RMSNorm", category="norm"),
-        SemanticBlock(label=attn_label, category="attention",
-                      annotation=attn_ann, residual_after=True),
-        SemanticBlock(label="RMSNorm", category="norm"),
-        SemanticBlock(label="Dense FFN", category="ffn",
-                      annotation=f"intermediate = {inter:,}" if inter else "",
-                      residual_after=True),
-    ]
-
-    # MoE layer blocks
-    expert_total = n_routed + n_shared
-    router_ann = f"Top-{top_k} of {n_routed} routed" if top_k and n_routed else ""
-    if n_shared:
-        router_ann += f" + {n_shared} shared"
-
-    expert_ffn = SemanticBlock(
-        label="EXPERT FFN (SwiGLU)", category="expert_pool", layout="vertical",
-        children=[
-            SemanticBlock(label="", category="projection", layout="parallel", children=[
-                SemanticBlock(label="Gate Projection", category="projection",
-                              annotation=f"\u2192 {moe_inter:,}" if moe_inter else "",
-                              width_fraction=0.48),
-                SemanticBlock(label="Up Projection", category="projection",
-                              annotation=f"\u2192 {moe_inter:,}" if moe_inter else "",
-                              width_fraction=0.48),
-            ]),
-            SemanticBlock(label="SiLU Activation", category="activation",
-                          annotation="Applied to gate", width_fraction=0.48),
-            SemanticBlock(label="Down Projection", category="projection",
-                          annotation=f"\u2192 {hs:,}" if hs else "",
-                          residual_after=True),
-        ],
-    )
-
-    expert_grid = SemanticBlock(
-        label="", category="expert_pool", layout="expert_grid",
-        expert_count=expert_total, expert_display=6,
-    )
-
-    moe_blocks = [
-        SemanticBlock(label="RMSNorm", category="norm"),
-        SemanticBlock(label=attn_label, category="attention",
-                      annotation=attn_ann, residual_after=True),
-        SemanticBlock(label="RMSNorm", category="norm"),
-        SemanticBlock(label="MoE Router", category="moe_router",
-                      annotation=router_ann),
-        expert_grid,
-        expert_ffn,
-    ]
-
-    layer_groups = []
-    if first_k > 0:
-        layer_groups.append(LayerGroupDef(
-            count=first_k, label=f"\u00d7{first_k} Dense layers",
-            blocks=dense_blocks))
-    moe_count = total_layers - first_k if total_layers else 0
-    if moe_count > 0 and (n_routed or has_moe_in_trace):
-        layer_groups.append(LayerGroupDef(
-            count=moe_count, label=f"\u00d7{moe_count} MoE layers",
-            blocks=moe_blocks))
-    elif moe_count > 0:
-        layer_groups.append(LayerGroupDef(
-            count=moe_count, label=f"\u00d7{moe_count} layers",
-            blocks=dense_blocks))
-    if not layer_groups and total_layers:
-        if has_moe_in_trace:
-            layer_groups.append(LayerGroupDef(
-                count=total_layers, label=f"\u00d7{total_layers} layers",
-                blocks=moe_blocks))
-        else:
-            layer_groups.append(LayerGroupDef(
-                count=total_layers, label=f"\u00d7{total_layers} layers",
-                blocks=dense_blocks))
-
-    # Metadata footer
-    meta = {}
-    meta["Type"] = "MoE" if (n_routed or has_moe_in_trace) else "Dense"
-    if first_k and moe_count:
-        meta["Layers"] = f"{first_k}D+{moe_count}M"
-    elif total_layers:
-        meta["Layers"] = str(total_layers)
-    meta["Attention"] = "MLA" if is_mla else "MHA"
-    if context_k:
-        meta["Context"] = f"{context_k}K"
-    if n_routed:
-        meta["Experts"] = f"{top_k}/{expert_total}"
-    elif has_moe_in_trace:
-        meta["Experts"] = "MoE"
-
-    return ArchTemplate(
-        title=model_name,
-        subtitle=subtitle,
-        header_blocks=[
-            SemanticBlock(label="Token Embedding", category="embedding",
-                          annotation=embed_ann),
-        ],
-        layer_groups=layer_groups,
-        footer_blocks=[
-            SemanticBlock(label="RMSNorm", category="norm"),
-            SemanticBlock(label="Output Head (LM Head)", category="lm_head",
-                          annotation=f"vocab = {vs:,}" if vs else ""),
-        ],
-        metadata=meta,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Template: Wan 2.2 Diffusion Transformer
-# ---------------------------------------------------------------------------
-
-def _build_wan_template(cfg: Dict[str, Any], root_type: str,
-                        raw_root=None) -> ArchTemplate:
-    layer_blocks = [
-        SemanticBlock(label="Self-Attention", category="attention",
-                      annotation="QKV + output projection"),
-        SemanticBlock(label="Cross-Attention", category="attention",
-                      annotation="Text-conditioned"),
-        SemanticBlock(label="MLP", category="ffn",
-                      annotation="Feed-forward"),
-    ]
-
-    num_blocks = cfg.get("num_hidden_layers", 0)
-    if not num_blocks and raw_root and hasattr(raw_root, "children"):
-        num_blocks = sum(
-            1 for c in raw_root.children
-            if "TransformerBlock" in c.module_type or "Block" in c.module_type
-        )
-    if not num_blocks:
-        num_blocks = 40
-
-    return ArchTemplate(
-        title="Wan 2.2 Transformer",
-        subtitle="Video Diffusion Model",
-        header_blocks=[
-            SemanticBlock(label="Patch Embedding", category="embedding",
-                          annotation="3D patch tokenization"),
-            SemanticBlock(label="Time + Text + Image Embedding", category="embedding",
-                          annotation="Conditioning signals"),
-        ],
-        layer_groups=[
-            LayerGroupDef(
-                count=num_blocks,
-                label=f"\u00d7{num_blocks} WanTransformerBlock",
-                blocks=layer_blocks,
-            ),
-        ],
-        footer_blocks=[
-            SemanticBlock(label="LayerNorm", category="norm"),
-            SemanticBlock(label="Output Projection", category="projection"),
-        ],
-        metadata={
-            "Type": "DiT",
-            "Blocks": str(num_blocks),
-            "Conditioning": "Text + Time",
-        },
-    )
-
-
-# ---------------------------------------------------------------------------
-# Template matcher
-# ---------------------------------------------------------------------------
-
-def match_template(root_type: str, cfg: Optional[Dict[str, Any]] = None,
-                   raw_root=None) -> Optional[ArchTemplate]:
-    """Auto-detect model type from trace root and build the appropriate template."""
-    rt = root_type.lower()
-    if cfg is None:
-        cfg = {}
-
-    if "deepseek" in rt:
-        return _build_deepseek_template(cfg, root_type, raw_root=raw_root)
-    if "wantransformer" in rt:
-        return _build_wan_template(cfg, root_type, raw_root=raw_root)
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1963,9 +2713,44 @@ class ArchDiagramRenderer:
 # arch_diagram_main — pipeline entry point
 # ---------------------------------------------------------------------------
 
+def _compute_template_width(template: ArchTemplate, min_w: int = 62) -> int:
+    """Compute the minimum box width so no annotation is truncated.
+
+    Scans all blocks (header, layer groups, footer) and returns a width
+    that can hold the longest ``label`` or ``annotation`` line without
+    clipping.  Group-interior blocks (inside ``║  ┌…┐║``) need 8 extra
+    columns for the border chrome.
+    """
+    max_content = 0  # longest content string across all blocks
+
+    def _visit(block: SemanticBlock, group_depth: int = 0):
+        nonlocal max_content
+        # chrome overhead: "  │ {content} │"  = 6  (outer box)
+        #                  "  ║  │ {content} │║" = 10  (group box)
+        overhead = 10 if group_depth else 6
+        if block.label:
+            max_content = max(max_content, len(block.label) + overhead)
+        if block.annotation:
+            # annotation has 2 extra indent spaces: "  ║  │   {ann} │║"
+            ann_overhead = overhead + 2
+            max_content = max(max_content, len(block.annotation) + ann_overhead)
+        for child in (block.children or []):
+            _visit(child, group_depth)
+
+    for b in template.header_blocks:
+        _visit(b, 0)
+    for b in template.footer_blocks:
+        _visit(b, 0)
+    for group in template.layer_groups:
+        for b in group.blocks:
+            _visit(b, 1)
+
+    return max(min_w, max_content)
+
+
 def template_to_text(template: ArchTemplate) -> str:
     """Render an ArchTemplate as a human-readable text diagram."""
-    W = 62
+    W = _compute_template_width(template, min_w=62)
     IW = W - 4
 
     lines: List[str] = []
@@ -2188,28 +2973,6 @@ def template_to_text_simplified(template: ArchTemplate) -> str:
     Layer groups are collapsed into single summary boxes instead of
     expanding all internal blocks (RMSNorm, Attention, MoE, etc.).
     """
-    W = 62
-    IW = W - 4
-
-    lines: List[str] = []
-
-    def _hbar(char="═"):
-        return char * W
-
-    def _box(label: str, annotation: str = "", prefix: str = "  "):
-        iw = W - len(prefix) - 2
-        max_content = iw - 2
-        lines.append(f"{prefix}┌{'─' * iw}┐")
-        lines.append(f"{prefix}│ {label[:max_content]:<{max_content}} │")
-        if annotation:
-            ann_text = f"  {annotation}" if not annotation.startswith(" ") else annotation
-            lines.append(f"{prefix}│{ann_text[:iw]:<{iw}}│")
-        lines.append(f"{prefix}└{'─' * iw}┘")
-
-    def _arrow(prefix: str = "  ", mid: int = IW // 2 + 2):
-        pad = " " * (mid - 1)
-        lines.append(f"{prefix}{pad}│")
-        lines.append(f"{prefix}{pad}▼")
 
     def _summarize_group(group: LayerGroupDef) -> Tuple[str, str]:
         """Produce (box_label, annotation) for a collapsed layer group."""
@@ -2260,6 +3023,43 @@ def template_to_text_simplified(template: ArchTemplate) -> str:
 
         return box_label, " · ".join(summary_parts)
 
+    # Pre-compute all (label, annotation) pairs to determine box width
+    all_pairs: List[Tuple[str, str]] = []
+    for block in template.header_blocks:
+        all_pairs.append((block.label, block.annotation or ""))
+    for group in template.layer_groups:
+        all_pairs.append(_summarize_group(group))
+    for block in template.footer_blocks:
+        all_pairs.append((block.label, block.annotation or ""))
+
+    # Compute width: annotation line is "  │  {ann}  │" → len(ann) + 8
+    #                label line is      "  │ {label} │" → len(label) + 6
+    min_w = 62
+    for label, ann in all_pairs:
+        min_w = max(min_w, len(label) + 6, len(ann) + 8)
+
+    W = min_w
+    IW = W - 4
+
+    lines: List[str] = []
+
+    def _hbar(char="═"):
+        return char * W
+
+    def _box(label: str, annotation: str = "", prefix: str = "  "):
+        iw = W - len(prefix) - 2
+        lines.append(f"{prefix}┌{'─' * iw}┐")
+        lines.append(f"{prefix}│ {label:<{iw - 2}} │")
+        if annotation:
+            ann_text = f"  {annotation}" if not annotation.startswith(" ") else annotation
+            lines.append(f"{prefix}│{ann_text:<{iw}}│")
+        lines.append(f"{prefix}└{'─' * iw}┘")
+
+    def _arrow(prefix: str = "  ", mid: int = IW // 2 + 2):
+        pad = " " * (mid - 1)
+        lines.append(f"{prefix}{pad}│")
+        lines.append(f"{prefix}{pad}▼")
+
     # --- Title ---
     lines.append(_hbar())
     lines.append(f"  {template.title}")
@@ -2303,18 +3103,23 @@ def template_to_text_simplified(template: ArchTemplate) -> str:
 
 def generate_arch_diagram(trace_path: str, output_png: str,
                           config_path: Optional[str] = None,
-                          detailed: bool = False):
+                          detailed: bool = False,
+                          sglang_path: str = "/sgl-workspace/sglang"):
     """Generate architecture diagram PNG from a trace file.
 
     Returns the path to the generated PNG, or None on failure.
     Writes a .txt companion file: simplified by default, detailed with detailed=True.
+
+    The pipeline auto-generates an ArchTemplate from the trace tree structure,
+    optional source code parsing, and config metadata — no model-specific
+    template code required.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
 
     extractor = TraceHierarchyExtractor(trace_path)
-    raw_root = extractor.extract_raw_root()
+    raw_root, cpu_ops = extractor.extract_raw_root_with_ops()
     if raw_root is None:
         logger.warning("No module hierarchy found in trace for arch diagram.")
         return None
@@ -2326,41 +3131,44 @@ def generate_arch_diagram(trace_path: str, output_png: str,
         with open(config_path, "r") as f:
             cfg = json.load(f)
 
-    template = match_template(root_type, cfg, raw_root=raw_root)
+    # Optional source-code enrichment
+    classes = {}
+    src_path = _find_model_source(root_type, sglang_path)
+    if src_path:
+        try:
+            classes = ModelFileParser(src_path).parse()
+            logger.info("Enriched from source: %s", src_path)
+        except Exception:
+            logger.debug("Source parsing failed for %s", src_path, exc_info=True)
+
+    template = module_tree_to_arch_template(raw_root, classes, cfg,
+                                            cpu_ops=cpu_ops)
     renderer = ArchDiagramRenderer()
 
-    if template:
-        logger.info("Using template for %s", root_type)
-        renderer.render_template_to_png(template, output_png)
+    logger.info("Auto-generated template for %s", root_type)
+    renderer.render_template_to_png(template, output_png)
 
-        base = output_png.rsplit(".", 1)[0]
-        if detailed:
-            txt_path = base + ".txt"
-            txt = template_to_text(template)
-            with open(txt_path, "w") as f:
-                f.write(txt + "\n")
-            logger.info("Detailed text diagram saved to %s", txt_path)
-        else:
-            txt_path = base + ".txt"
-            txt = template_to_text_simplified(template)
-            with open(txt_path, "w") as f:
-                f.write(txt + "\n")
-            logger.info("Simplified text diagram saved to %s", txt_path)
+    base = output_png.rsplit(".", 1)[0]
+    if detailed:
+        txt_path = base + ".txt"
+        txt = template_to_text(template)
+        with open(txt_path, "w") as f:
+            f.write(txt + "\n")
+        logger.info("Detailed text diagram saved to %s", txt_path)
     else:
-        logger.info("No template for %s, using fallback renderer", root_type)
-        arch_roots = extractor.extract()
-        title = root_type
-        archs = cfg.get("architectures", [])
-        if archs:
-            title = archs[0]
-        renderer.render_fallback_to_png(arch_roots, output_png, title=title)
+        txt_path = base + ".txt"
+        txt = template_to_text_simplified(template)
+        with open(txt_path, "w") as f:
+            f.write(txt + "\n")
+        logger.info("Simplified text diagram saved to %s", txt_path)
 
     return output_png
 
 
 def arch_diagram_main(trace_path: str,
                       config_path: Optional[str] = None,
-                      detailed: bool = False):
+                      detailed: bool = False,
+                      sglang_path: str = "/sgl-workspace/sglang"):
     """End-to-end pipeline: trace -> arch_diagram/ folder with PNG + TXT."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
@@ -2374,7 +3182,7 @@ def arch_diagram_main(trace_path: str,
 
     print(f"Generating architecture diagram from: {os.path.abspath(trace_path)}")
     result = generate_arch_diagram(trace_path, png_path, config_path=config_path,
-                                   detailed=detailed)
+                                   detailed=detailed, sglang_path=sglang_path)
     if result is None:
         print("ERROR: Failed to generate diagram.", file=sys.stderr)
         sys.exit(1)
@@ -2449,6 +3257,11 @@ def main():
         help="Generate detailed text diagram (expanded layer internals). "
              "Default is simplified (collapsed layer groups).",
     )
+    parser.add_argument(
+        "--sglang-path", metavar="PATH", default="/sgl-workspace/sglang",
+        help="Path to sglang repo root for source-code enrichment "
+             "(default: /sgl-workspace/sglang)",
+    )
 
     args = parser.parse_args()
 
@@ -2461,7 +3274,8 @@ def main():
             print(f"Error: Trace file not found: {args.trace}", file=sys.stderr)
             sys.exit(1)
         arch_diagram_main(args.trace, config_path=args.config,
-                          detailed=args.detailed)
+                          detailed=args.detailed,
+                          sglang_path=args.sglang_path)
         return
 
     # --- Original static analysis mode ---
