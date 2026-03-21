@@ -52,6 +52,7 @@ import gzip
 import json
 import logging
 import math
+import operator
 import os
 import re
 import sys
@@ -91,16 +92,25 @@ class ModuleNode:
     cpu_ops: List[Dict] = field(default_factory=list)
 
 
-@dataclass
 class KernelDetail:
-    """Individual kernel/op record for detail reporting."""
-    name: str
-    duration: float
-    category: str
-    module_path: str  # e.g. "WanTransformerBlock_1/WanT2VCrossAttention_0"
-    ts: float = 0.0
-    phase: str = ""  # "prefill" / "decode" / ""
-    input_dims: str = ""  # e.g. "[[1, 75600, 10, 128], ...]"
+    """Individual kernel/op record for detail reporting.
+
+    Uses __slots__ for fast instantiation (critical when creating millions
+    of instances for large traces).
+    """
+    __slots__ = ("name", "duration", "category", "module_path",
+                 "ts", "phase", "input_dims")
+
+    def __init__(self, name: str, duration: float, category: str,
+                 module_path: str, ts: float = 0.0, phase: str = "",
+                 input_dims: str = ""):
+        self.name = name
+        self.duration = duration
+        self.category = category
+        self.module_path = module_path
+        self.ts = ts
+        self.phase = phase
+        self.input_dims = input_dims
 
 
 @dataclass
@@ -652,19 +662,32 @@ def _load_kernel_categories(csv_path: str = _DEFAULT_CSV) -> List[Tuple[str, re.
 _KERNEL_CATEGORIES = _load_kernel_categories()
 
 
+_categorize_cache: Dict[str, str] = {}
+
+
 def _categorize_kernel(name: str) -> str:
     """Categorize a kernel name into a high-level category."""
+    cached = _categorize_cache.get(name)
+    if cached is not None:
+        return cached
     for cat, pat in _KERNEL_CATEGORIES:
         if pat.search(name):
+            _categorize_cache[name] = cat
             return cat
+    _categorize_cache[name] = "other"
     return "other"
 
 
 def _categorize_cpu_op(name: str) -> str:
     """Categorize a cpu_op name into a high-level category."""
+    cached = _categorize_cache.get(name)
+    if cached is not None:
+        return cached
     for cat, pat in _KERNEL_CATEGORIES:
         if pat.search(name):
+            _categorize_cache[name] = cat
             return cat
+    _categorize_cache[name] = "other"
     return "other"
 
 
@@ -718,7 +741,7 @@ class ModuleAggregator:
                 input_dims=dims if dims else ""))
 
         # Sort own details by timestamp
-        stats.kernel_details.sort(key=lambda d: d.ts)
+        stats.kernel_details.sort(key=operator.attrgetter("ts"))
 
         # Recurse children
         stats.total_kernel_time = stats.self_kernel_time
@@ -777,8 +800,10 @@ class PhaseDetector:
 
     def _tag_nodes_from_phases(self, nodes: List[ModuleNode], phases: List[Tuple],
                                parent_phase: Optional[str] = None,
-                               is_root: bool = True):
-        phase_ts = [p[0] for p in phases]
+                               is_root: bool = True,
+                               _phase_ts: Optional[List[float]] = None):
+        if _phase_ts is None:
+            _phase_ts = [p[0] for p in phases]
         for node in nodes:
             if parent_phase:
                 # Children inherit parent phase — a forward pass is entirely
@@ -786,7 +811,7 @@ class PhaseDetector:
                 # a stale marker when timestamps are close to a boundary.
                 node._phase = parent_phase  # type: ignore[attr-defined]
             elif not is_root:
-                idx = bisect.bisect_right(phase_ts, node.ts) - 1
+                idx = bisect.bisect_right(_phase_ts, node.ts) - 1
                 if 0 <= idx < len(phases):
                     _, phase, _, _ = phases[idx]
                     node._phase = phase  # type: ignore[attr-defined]
@@ -797,7 +822,8 @@ class PhaseDetector:
             self._tag_nodes_from_phases(
                 node.children, phases,
                 parent_phase=child_phase,
-                is_root=False)
+                is_root=False,
+                _phase_ts=_phase_ts)
 
     def _detect_from_cpu_ops(self, nodes: List[ModuleNode]):
         """Fall back to checking cpu_op names for prefill/decode keywords."""
