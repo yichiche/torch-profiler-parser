@@ -1260,7 +1260,14 @@ class ReportGenerator:
         type_agg_flat: Dict[str, List[float]] = defaultdict(list)
         self._collect_by_type(stats_list, type_agg_flat, mode)
         type_total_time = {mtype: sum(times) for mtype, times in type_agg_flat.items()}
+        # Seed detail-sheet representatives from the Module Tree instances so
+        # that the detail tab numbers match the tree.  _find_median_instance
+        # only fills types not already present.
         seen_types: Dict[Tuple[str, str], ModuleStats] = {}
+        for s in stats_list:
+            if s.module_type in seen_tree_roots:
+                self._collect_tree_instances(s, seen_types)
+                break  # only the first root was written to the tree
         self._find_median_instance_per_type(stats_list, seen_types, mode,
                                             force_types=top_type_names)
         # Sort detail tabs by total kernel time descending (highest % first)
@@ -1919,6 +1926,22 @@ class ReportGenerator:
             current = significant[0][1]
         return chain
 
+    @staticmethod
+    def _collect_tree_instances(root_stats: ModuleStats,
+                                out: Dict[Tuple[str, str], ModuleStats]):
+        """Collect first instance of each (module_type, phase) from a tree.
+
+        Walks the same tree that _write_tree_rows renders in the Module Tree
+        tab, recording the first instance per (type, phase) pair.  These are
+        used to seed the detail-sheet representatives so that detail tabs
+        show the exact same instances visible in the tree.
+        """
+        key = (root_stats.module_type, getattr(root_stats, "phase", ""))
+        if key not in out and root_stats.kernel_count > 0:
+            out[key] = root_stats
+        for child in root_stats.children_stats:
+            ReportGenerator._collect_tree_instances(child, out)
+
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
                                        seen: Dict[Tuple[str, str], ModuleStats],
                                        mode: str,
@@ -1927,6 +1950,10 @@ class ReportGenerator:
 
         Groups by (module_type, phase) so that prefill and decode get separate
         representative instances, producing separate detail sheets.
+        Skips (type, phase) pairs already present in *seen* (e.g. seeded
+        from the Module Tree) so that detail tabs stay consistent with
+        the tree.
+
         force_types: if given, always include these types even if they are leaf modules.
         """
         # First collect all instances per type
@@ -1942,6 +1969,8 @@ class ReportGenerator:
             for s in instances:
                 by_phase[getattr(s, "phase", "")].append(s)
             for phase, phase_instances in by_phase.items():
+                if (mtype, phase) in seen:
+                    continue
                 timed = sorted(phase_instances,
                                key=lambda s: s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
                 mid = len(timed) // 2
@@ -2211,6 +2240,7 @@ class TraceModuleAnalyzer:
         for node, stats in zip(nodes, stats_list):
             stats.phase = getattr(node, "_phase", "")
             self._copy_phase_to_stats(node.children, stats.children_stats)
+
 
     def _fallback_kernel_only(self, kernel_events: List[Dict]):
         """Basic kernel-only analysis when no module events are present."""
