@@ -10,10 +10,14 @@ The primary tool is `trace_module_analyzer.py`, which uses nn.Module correlation
 Raw Trace (.trace.json.gz)
   │
   ├─► trace_module_analyzer.py ──► report.xlsx  (module-level kernel breakdown)
-  │     (optionally applies fix_rocm_trace_flow.py for ROCm traces)
+  │     ├── reads kernel_categories.csv for classification rules
+  │     ├── optionally applies fix_rocm_trace_flow.py for ROCm traces
+  │     └── optionally adds Model Info tab via model_inspector.py (--model-info)
   │
-  └─► model_inspector.py ──► model structure tree / architecture diagrams
-        (standalone, or enriches trace_module_analyzer output)
+  ├─► model_inspector.py ──► model structure tree / architecture diagrams
+  │     (standalone, or enriches trace_module_analyzer output)
+  │
+  └─► compare_analysis.py ──► comparison report between two analysis.xlsx files
 ```
 
 ## Tools Reference
@@ -23,59 +27,86 @@ Raw Trace (.trace.json.gz)
 Correlation-based GPU kernel classification using nn.Module hierarchy from PyTorch profiler traces. Works with both LLM traces (CPU-only module spans) and diffusion model traces (with GPU kernel events).
 
 ```bash
-# Basic analysis
-python3trace_module_analyzer.py trace.json.gz -o report.xlsx
+# Generate an Excel report
+python3 trace_module_analyzer.py trace.json.gz -o report.xlsx
 
-# Enrich with HuggingFace config (adds head counts, vocab size, expert config)
-python3trace_module_analyzer.py trace.json.gz -o report.xlsx --config config.json
+# Include detail sheets for up to 10 module types
+python3 trace_module_analyzer.py trace.json.gz -o report.xlsx --max-detail-modules 10
 
 # Show kernel-by-kernel detail for a specific module type
-python3trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock
+python3 trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock
 
-# Show specific instance
-python3trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --detail-instance 5
+# Pick the 5th occurrence instead of the median
+python3 trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --module-index 5
 
-# Show full module tree
-python3trace_module_analyzer.py trace.json.gz --show-tree
+# Include a Model Info tab with architecture summary
+python3 trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info
 
 # Disable automatic ROCm trace fix
-python3trace_module_analyzer.py trace.json.gz --no-rocm-fix
+python3 trace_module_analyzer.py trace.json.gz --no-rocm-fix
 ```
+
+#### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `trace_file` | *(required)* | Path to trace file (`.json.gz` or `.json`) |
+| `-o`, `--output` | None | Output Excel report path (`.xlsx`) |
+| `--max-detail-modules` | 3 | Number of module types to generate detail sheets for (0=all) |
+| `--detail-module` | None | Specify module types for kernel-by-kernel detail |
+| `--module-index` | median | Which occurrence of the module to show detail for |
+| `--model-info` | off | Add a Model Info tab with architecture summary |
+| `--no-rocm-fix` | off | Disable automatic ROCm trace fix |
+| `-v`, `--verbose` | off | Enable debug logging |
+
+### kernel_categories.csv — Kernel Classification Rules
+
+Editable CSV that maps kernel names to categories (e.g. attention, gemm, communication). Each row has a `category` and a `pattern` (regex alternation). Rows are matched top-to-bottom; first match wins.
+
+To add a new pattern, append `|yourpattern` to the relevant row. To add a new category, add a new row. Order matters — place more specific categories above general ones.
 
 ### fix_rocm_trace_flow.py — ROCm Trace Fix
 
 Fixes missing CUDA-graph flow events in ROCm/MI355 traces. Automatically applied by `trace_module_analyzer.py` unless `--no-rocm-fix` is passed. Can also be used standalone:
 
 ```bash
-python3fix_rocm_trace_flow.py trace.json.gz -o trace_fixed.json.gz
-python3fix_rocm_trace_flow.py trace.json.gz --in-place
+python3 fix_rocm_trace_flow.py trace.json.gz -o trace_fixed.json.gz
+python3 fix_rocm_trace_flow.py trace.json.gz --in-place
 ```
 
 ### model_inspector.py — Model Structure Inspector
 
-Static model structure analysis from Python source code, plus trace-based architecture diagrams.
+Static model structure analysis from Python source code, plus trace-based architecture diagrams. Used by `--model-info` flag in `trace_module_analyzer.py`.
 
 ```bash
 # List classes in a model file
-python3model_inspector.py deepseek_v2.py --list-classes
+python3 model_inspector.py deepseek_v2.py --list-classes
 
 # Show module hierarchy tree
-python3model_inspector.py deepseek_v2.py --root DeepseekV2ForCausalLM
+python3 model_inspector.py deepseek_v2.py --root DeepseekV2ForCausalLM
 
 # PyTorch-profiler-style tree with layer instances expanded
-python3model_inspector.py deepseek_v2.py --profiler-tree --config config.json
+python3 model_inspector.py deepseek_v2.py --profiler-tree
 
 # Generate architecture block diagram from a trace file
-python3model_inspector.py --trace trace.json.gz --arch-diagram
-python3model_inspector.py --trace trace.json.gz --arch-diagram --detailed
+python3 model_inspector.py --trace trace.json.gz --arch-diagram
+python3 model_inspector.py --trace trace.json.gz --arch-diagram --detailed
 ```
+
+### kernel_projection.py — Kernel Improvement Projector
+
+Estimates TTFT/ITL impact from kernel-level improvements.
+
+### compare_analysis.py — Report Comparison
+
+Compares two `analysis.xlsx` files to show regressions and improvements between runs.
 
 ### evaluate_module_parsing.py — Quality Evaluator
 
 Evaluates the output of `trace_module_analyzer.py`. Used by the perf-regression pipeline for quality gating.
 
 ```bash
-python3evaluate_module_parsing.py report.xlsx --json
+python3 evaluate_module_parsing.py report.xlsx --json
 ```
 
 ## Output File Formats
@@ -86,7 +117,7 @@ An Excel workbook with module-level kernel breakdown:
 
 - **Summary sheet**: Overall stats — total time, module type breakdown, top kernels per module type
 - **Module type sheets**: Per-module-type detail with kernel lists, timing, and percentages
-- **Model Info sheet** (with `--config`): HuggingFace model configuration details
+- **Model Info sheet** (with `--model-info`): Architecture summary and optional diagram from `model_inspector.py`
 
 ### evaluation.json — Quality Assessment
 
@@ -126,7 +157,7 @@ Within a run directory, profiling outputs are in the `trace_analysis/` subdirect
 
 For new analysis, use `trace_module_analyzer.py`:
 ```bash
-python3trace_module_analyzer.py /path/to/trace.json.gz -o report.xlsx -v
+python3 trace_module_analyzer.py /path/to/trace.json.gz -o report.xlsx -v
 ```
 
 For existing analysis, read the `analysis.xlsx` and `evaluation.json` files in the `trace_analysis/` subdirectory.
@@ -139,10 +170,11 @@ Common questions and how to answer them:
 |----------|---------------|
 | "What modules take the most time?" | trace_module_analyzer summary sheet |
 | "What kernels run in module X?" | trace_module_analyzer --detail-module X |
-| "What's the model architecture?" | model_inspector --profiler-tree or --arch-diagram |
-| "What's the prefill/decode split?" | trace_module_analyzer summary sheet |
+| "What's the model architecture?" | trace_module_analyzer --model-info, or model_inspector standalone |
+| "What's the prefill/decode split?" | trace_module_analyzer summary sheet (phase column) |
 | "Is the trace parsing reliable?" | evaluate_module_parsing --json overall score |
 | "Which layers are outliers?" | evaluate_module_parsing --json structural rules |
+| "How does this compare to baseline?" | compare_analysis.py with two report files |
 
 ## Key Concepts
 
