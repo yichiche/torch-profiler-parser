@@ -99,7 +99,35 @@ Estimates TTFT/ITL impact from kernel-level improvements.
 
 ### compare_analysis.py — Report Comparison
 
-Compares two `analysis.xlsx` files to show regressions and improvements between runs.
+Action-oriented diff of two `analysis.xlsx` reports. Designed for two use cases:
+- **Same-platform diff** (e.g. MI355 aiter vs triton): detects kernel replacements (GONE/NEW pairs), same-kernel time changes, and per-category breakdown.
+- **Cross-platform diff** (e.g. MI355 vs B200): category-first drill-down to find biggest gaps, then top kernels within each.
+
+```bash
+# Terminal report (labels auto-detected from directory names)
+python3 compare_analysis.py baseline/analysis.xlsx target/analysis.xlsx
+
+# Custom labels + Excel output
+python3 compare_analysis.py a.xlsx b.xlsx --labels MI355-aiter MI355-triton -o diff.xlsx
+```
+
+#### Report Sections
+
+1. **Executive Summary** — total kernel time delta and % change
+2. **Phase Breakdown** — prefill vs decode split with per-block category and kernel diffs
+3. **Kernel Replacements** — side-by-side table of GONE/NEW kernel pairs (with cross-category matching for recategorized kernels), showing net time impact
+4. **Category Drill-Down** — per-category delta sorted by magnitude (decreases first, then increases), with top contributing kernels and % of category delta
+5. **Kernel Time Changes** — same-name kernels present in both traces with different time, sorted by |delta|
+6. **Actionable Summary** — compact replacement table and top same-kernel time changes
+
+#### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `baseline` | *(required)* | Baseline analysis.xlsx (file A) |
+| `target` | *(required)* | Target analysis.xlsx (file B) |
+| `-o`, `--output` | None | Output Excel diff report (`.xlsx`) |
+| `--labels` | auto-detect | Labels for the two files (e.g. `--labels BF16 FP8`) |
 
 ### evaluate_module_parsing.py — Quality Evaluator
 
@@ -174,7 +202,7 @@ Common questions and how to answer them:
 | "What's the prefill/decode split?" | trace_module_analyzer summary sheet (phase column) |
 | "Is the trace parsing reliable?" | evaluate_module_parsing --json overall score |
 | "Which layers are outliers?" | evaluate_module_parsing --json structural rules |
-| "How does this compare to baseline?" | compare_analysis.py with two report files |
+| "How does this compare to baseline?" | compare_analysis.py with two report files (shows replacements, time changes, category drill-down) |
 
 ## Key Concepts
 
