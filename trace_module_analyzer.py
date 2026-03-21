@@ -7,6 +7,42 @@ kernels by module, eliminating the need for hardcoded regex patterns.
 Supports two trace modes:
   - Full mode: kernel events present (diffusion traces) — correlates via cuda_runtime
   - CPU-only mode: no kernel events (LLM traces) — uses cpu_op time containment
+
+Pipeline:
+  ModuleTreeBuilder     — Parse python_function events into an nn.Module hierarchy tree.
+  KernelCorrelator      — Map GPU kernels to modules via cuda_runtime correlation IDs.
+  CudaGraphCorrelator   — Handle CUDA-graph-replayed kernels by mapping them to
+                           synthetic layer modules.
+  CpuOpCorrelator       — Map cpu_ops to modules via timestamp containment (CPU-only mode).
+  ModuleAggregator      — Roll up per-module statistics (time, counts, breakdowns).
+  PhaseDetector         — Detect prefill vs decode phases in LLM traces.
+  ReportGenerator       — Produce console summaries and Excel reports.
+  TraceModuleAnalyzer   — Top-level orchestrator that chains all the above.
+
+PhaseDetector (prefill vs decode):
+  Two-tier approach — use explicit markers when available, fall back to heuristics.
+
+  1. Phase markers: During trace loading, scan python_function events for
+     forward_batch_info names. "is_extend" maps to prefill (SGLang terminology),
+     "is_decode" (excluding "is_decode_or_idle") maps to decode. Each marker
+     records (timestamp, phase, tid, pid).
+
+  2. Tagging modules: For each module node, binary-search the sorted marker list
+     to find the most recent marker before the module's start time. That marker's
+     phase is assigned to the module. Children inherit their parent's phase since
+     a single forward pass is entirely prefill or entirely decode.
+
+     Example: if the marker list is [(t=100, decode), (t=500, prefill), (t=900, decode)]
+     and DeepseekV2Model_0 starts at t=520, bisect finds the t=500 "prefill" marker,
+     so the entire subtree (DeepseekV2DecoderLayer_0, DeepseekV2AttentionMLA_0,
+     RadixAttention_0, etc.) is tagged as prefill without re-searching each child.
+
+  3. Fallback (no markers): If the trace has no forward_batch_info markers
+     (e.g. non-SGLang traces), scan each module's cpu_op event names and
+     majority-vote on "prefill"/"extend" vs "decode" keywords.
+
+  4. Propagation: _propagate_phase pushes assigned phases down to any untagged
+     child nodes, ensuring every node in the tree has a phase label.
 """
 
 import argparse
