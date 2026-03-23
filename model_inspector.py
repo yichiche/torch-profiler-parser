@@ -1,18 +1,120 @@
-"""Static model structure inspector for SGLang model files.
+"""model_inspector.py -- Static model structure inspector for SGLang model files.
 
-Parses model Python source files using the `ast` module (no GPU, no model loading)
-and produces a readable nn.Module hierarchy tree + config metadata summary.
+Inspects SGLang / HuggingFace model architectures **without loading weights or
+requiring a GPU**. Operates in two independent modes:
 
-Usage:
-    python model_inspector.py <model_file.py> [options]
+  1. Static Analysis  -- Parse a model .py file with `ast` to produce an
+     nn.Module hierarchy tree, optionally enriched with config.json metadata.
+  2. Architecture Diagram -- Read a Chrome/PyTorch trace (.json/.json.gz),
+     rebuild the runtime module tree from `nn.Module:` profiler events, and
+     render a PNG block diagram + companion TXT file.
 
-Examples:
-    python model_inspector.py /path/to/deepseek_v2.py --list-classes
-    python model_inspector.py /path/to/deepseek_v2.py --root DeepseekV2ForCausalLM
-    python model_inspector.py /path/to/deepseek_v2.py --config /path/to/config.json -o out.txt
+===========================================================================
+MODE 1: STATIC ANALYSIS  (default when a model_file is given)
+===========================================================================
 
-    python3 /home/yichiche/agent-box/profile/model_inspector.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py --config /data/deepseek-ai/DeepSeek-R1-0528/config.json
-    python3 /home/yichiche/agent-box/profile/model_inspector.py /sgl-workspace/sglang/python/sglang/srt/models/grok.py --config /data/huggingface/hub/xai-org/grok-2/config.json
+  python model_inspector.py <model_file.py> [options]
+
+  Parses the model source with `ast`, identifies nn.Module subclasses and
+  their `self.xxx = SomeModule(...)` assignments in __init__, then builds a
+  recursive hierarchy tree rooted at the top-level *ForCausalLM class.
+
+  Options
+  -------
+  --root CLASS          Root class name. Default: auto-detect *ForCausalLM.
+  --config PATH         HuggingFace config.json -- appends a summary of
+                        architecture-relevant keys (hidden sizes, layer
+                        counts, MoE params, RoPE, etc.) to the output.
+  --list-classes        List all classes found in the file with their bases,
+                        assignment counts, and config key accesses, then exit.
+  --show-line-numbers   Append [L<n>] source line numbers to tree nodes.
+  --output, -o PATH     Write output to a file instead of stdout.
+
+  Profiler-style tree
+  -------------------
+  --profiler-tree       Expand layers into individual instances (Layer_0,
+                        Layer_1, ...) like a PyTorch profiler trace. Config
+                        is used internally for layer counts and hybrid
+                        dispatch resolution but is NOT printed separately.
+  --depth N             Max recursion depth for --profiler-tree (default: 2).
+
+  Examples
+  --------
+  # List all classes in a model file
+  python model_inspector.py deepseek_v2.py --list-classes
+
+  # Default hierarchy tree with auto-detected root
+  python model_inspector.py deepseek_v2.py
+
+  # Specify root class explicitly
+  python model_inspector.py deepseek_v2.py --root DeepseekV2ForCausalLM
+
+  # Tree + config metadata summary, saved to file
+  python model_inspector.py deepseek_v2.py --config config.json -o out.txt
+
+  # Tree with source line numbers
+  python model_inspector.py deepseek_v2.py --show-line-numbers
+
+  # Profiler-style expanded tree (depth 3)
+  python model_inspector.py deepseek_v2.py --profiler-tree --config config.json --depth 3
+
+  # Real-world examples
+  python3 model_inspector.py \\
+      /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py \\
+      --config /data/deepseek-ai/DeepSeek-R1-0528/config.json
+
+  python3 model_inspector.py \\
+      /sgl-workspace/sglang/python/sglang/srt/models/grok.py \\
+      --config /data/huggingface/hub/xai-org/grok-2/config.json
+
+===========================================================================
+MODE 2: ARCHITECTURE DIAGRAM  (--arch-diagram --trace <path>)
+===========================================================================
+
+  python model_inspector.py --arch-diagram --trace <trace.json.gz> [options]
+
+  Reads a Chrome/PyTorch trace file, extracts `nn.Module:` events to rebuild
+  the runtime module hierarchy, then renders a dark-themed PNG block diagram
+  and a companion TXT description. Output is written to an `arch_diagram/`
+  directory next to the trace file.
+
+  The model_file positional argument is NOT required in this mode.
+
+  Options
+  -------
+  --trace PATH          Path to trace file (.json.gz or .json). Required.
+  --config PATH         HuggingFace config.json -- used for subtitles,
+                        annotations, and metadata in the diagram.
+  --detailed            Generate a detailed TXT companion (expanded layer
+                        internals). Default is a simplified/collapsed view.
+  --sglang-path PATH    Path to the SGLang repo root for source-code
+                        enrichment (default: /sgl-workspace/sglang). The
+                        tool searches models/*.py to find the root module
+                        class and enrich the diagram with static structure.
+
+  Output files (created in <trace_dir>/arch_diagram/):
+    arch_diagram.png    Dark-themed block diagram of the model architecture.
+    arch_diagram.txt    Text description (simplified or detailed).
+
+  Examples
+  --------
+  # Basic architecture diagram from a trace
+  python model_inspector.py --arch-diagram \\
+      --trace /path/to/trace.json.gz
+
+  # With config for richer annotations
+  python model_inspector.py --arch-diagram \\
+      --trace /path/to/trace.json.gz \\
+      --config /data/deepseek-ai/DeepSeek-R1-0528/config.json
+
+  # Detailed text companion
+  python model_inspector.py --arch-diagram \\
+      --trace /path/to/trace.json.gz --detailed
+
+  # Custom SGLang repo path
+  python model_inspector.py --arch-diagram \\
+      --trace /path/to/trace.json.gz \\
+      --sglang-path /home/user/sglang
 """
 
 import argparse
@@ -1064,10 +1166,13 @@ ARCH_COLOR_MAP = {
     "projection":   "#0e7490",
     "activation":   "#2d8659",
     "lm_head":      "#0e7490",
+    "sampler":      "#374151",
     "default":      "#374151",
 }
 
 _CATEGORY_PATTERNS = [
+    ("lm_head",     re.compile(r"LogitsProcessor|LMHead|lm_head", re.IGNORECASE)),
+    ("sampler",     re.compile(r"^Sampler$", re.IGNORECASE)),
     ("embedding",   re.compile(r"Embed|Embedding|RotaryEmb|VocabParallel", re.IGNORECASE)),
     ("attention",   re.compile(
         r"Attention|Attn|MLA|SelfAttn|CrossAttn|MultiHead|FlashAttn", re.IGNORECASE)),
@@ -1220,6 +1325,8 @@ _HUMANIZE_MAP = {
     "SiluAndMul": "SiLU Activation",
     "MoEGate": "MoE Router",
     "TopK": "MoE Router",
+    "LogitsProcessor": "Output Head (Logits)",
+    "Sampler": "Sampler",
 }
 
 # Regex-based humanization for patterns like DeepseekV2AttentionMLA
@@ -1386,65 +1493,142 @@ def _trace_layer_groups(raw_root):
     ``(layer_type, count, child_types, representative_children)`` tuples.
     ``representative_children`` is the actual list of ModuleNode children
     from one decoder layer in the group (for structural inspection).
+
+    Any module_type that appears more than once is treated as a "layer type".
+    This handles hybrid architectures (e.g. 45 MoE layers + 15 attention
+    layers with different module_types).
     """
     children = list(raw_root.children) if hasattr(raw_root, "children") else []
     if not children:
         return ([], [], [])
 
-    # Count occurrences of each module_type
     type_counts: Dict[str, int] = defaultdict(int)
     for c in children:
         type_counts[c.module_type] += 1
 
-    # The decoder layer type is the most-repeated child
     if not type_counts:
         return (children, [], [])
-    decoder_type = max(type_counts, key=lambda t: type_counts[t])
-    if type_counts[decoder_type] <= 1:
-        # No repeated type => no decoder layers detected
+
+    layer_types = {t for t, cnt in type_counts.items() if cnt > 1}
+    if not layer_types:
         return (children, [], [])
 
-    # Split into header / decoder layers / footer
-    header = []
-    footer = []
-    decoder_layers = []
-    in_decoder = False
-    past_decoder = False
-    for c in children:
-        if c.module_type == decoder_type:
-            in_decoder = True
-            past_decoder = False
-            decoder_layers.append(c)
-        else:
-            if in_decoder:
-                in_decoder = False
-                past_decoder = True
-            if past_decoder:
-                footer.append(c)
-            else:
-                header.append(c)
+    # Find the span [first_layer_idx, last_layer_idx] covering all layer-type
+    # children.  Everything before is header, everything after is footer.
+    first_layer_idx = None
+    last_layer_idx = None
+    for i, c in enumerate(children):
+        if c.module_type in layer_types:
+            if first_layer_idx is None:
+                first_layer_idx = i
+            last_layer_idx = i
 
-    # Group consecutive decoder layers by their child type signature
-    # Keep a representative layer per group for structural inspection
+    header = children[:first_layer_idx]
+    footer = children[last_layer_idx + 1:]
+    middle = children[first_layer_idx:last_layer_idx + 1]
+
+    # Walk the middle section and build groups.  Consecutive children of the
+    # same layer_type are merged; singleton non-layer children sandwiched
+    # between layer runs are absorbed into the footer (they are typically
+    # norm layers or other one-offs that the template renderer already
+    # synthesises).
     groups: List[Tuple[str, int, List[str], list]] = []
-    for dl in decoder_layers:
-        dl_children = list(getattr(dl, "children", []))
+    extra_footer: list = []
+    for c in middle:
+        if c.module_type not in layer_types:
+            extra_footer.append(c)
+            continue
+        dl_children = list(getattr(c, "children", []))
         child_types = [gc.module_type for gc in dl_children]
         sig = tuple(child_types)
-        if groups and groups[-1][0] == decoder_type and tuple(groups[-1][2]) == sig:
-            groups[-1] = (groups[-1][0], groups[-1][1] + 1, groups[-1][2],
-                          groups[-1][3])
+        if (groups
+                and groups[-1][0] == c.module_type
+                and tuple(groups[-1][2]) == sig):
+            groups[-1] = (groups[-1][0], groups[-1][1] + 1,
+                          groups[-1][2], groups[-1][3])
         else:
-            groups.append((decoder_type, 1, list(child_types), dl_children))
+            groups.append((c.module_type, 1, list(child_types), dl_children))
 
+    # Detect repeating interleaved patterns.
+    # Hybrid architectures like Qwen3.5 interleave layer types (e.g.
+    # [3×A, 1×B, 3×A, 1×B, ...]).  Instead of collapsing into [45×A, 15×B],
+    # detect the repeating unit [3×A, 1×B] and represent it as a single
+    # composite group repeated 15 times.
+    groups = _merge_repeating_pattern(groups)
+
+    footer = extra_footer + footer
     return (header, groups, footer)
 
 
-def _classify_group_label(child_types: List[str], count: int) -> str:
-    """Return a label like 'x3 Dense layers' or 'x58 MoE layers'."""
+def _merge_repeating_pattern(groups):
+    """Detect a repeating interleaved pattern in *groups* and collapse it.
+
+    Given groups like ``[3×A, 1×B, 3×A, 1×B, ...]``, detect the repeating
+    unit ``[3×A, 1×B]`` and return a single composite group that represents
+    ``×15 [3×A + 1×B]``.
+
+    A composite group is a 5-tuple:
+      ``("__composite__", n_repeats, merged_child_types, repr_children, sub_groups)``
+    where *sub_groups* is the list of ``(layer_type, count_per_repeat, ...)``
+    tuples from one period of the pattern.
+
+    If no repeating pattern is found, returns *groups* unchanged.
+    """
+    if len(groups) <= 2:
+        return groups
+
+    # Try pattern lengths from 2 up to half the number of groups.
+    for period in range(2, len(groups) // 2 + 1):
+        if len(groups) % period != 0:
+            continue
+        pattern = groups[:period]
+        n_repeats = len(groups) // period
+        if n_repeats < 2:
+            continue
+        # Check that every period matches the pattern (same types and counts)
+        match = True
+        for i in range(1, n_repeats):
+            chunk = groups[i * period:(i + 1) * period]
+            for (lt1, c1, ct1, _), (lt2, c2, ct2, _) in zip(pattern, chunk):
+                if lt1 != lt2 or c1 != c2 or tuple(ct1) != tuple(ct2):
+                    match = False
+                    break
+            if not match:
+                break
+        if match:
+            merged_child_types = []
+            seen = set()
+            for _, _, cts, _ in pattern:
+                for t in cts:
+                    if t not in seen:
+                        seen.add(t)
+                        merged_child_types.append(t)
+            return [("__composite__", n_repeats, merged_child_types,
+                     pattern[0][3], list(pattern))]
+
+    return groups
+
+
+def _classify_group_label(child_types: List[str], count: int,
+                          layer_type: str = "") -> str:
+    """Return a label like 'x3 Dense layers' or 'x58 MoE layers'.
+
+    *layer_type* is the module_type of the layer itself (the parent), used
+    to produce a more descriptive label when child_types is empty (e.g.
+    leaf-level attention modules that have no trace sub-children).
+    """
     cats = {classify_module_category(t) for t in child_types}
     if "moe_router" in cats or "expert_pool" in cats:
         return f"\u00d7{count} MoE layers"
+    if child_types:
+        return f"\u00d7{count} Dense layers"
+    # Leaf-level layers with no children — derive label from the layer type
+    layer_cat = classify_module_category(layer_type) if layer_type else ""
+    layer_label = _humanize_module_type(layer_type, layer_cat) if layer_type else ""
+    if layer_label and layer_label != layer_type:
+        return f"\u00d7{count} {layer_label} layers \u00b7 {layer_type}"
+    if layer_type:
+        return f"\u00d7{count} layers \u00b7 {layer_type}"
     return f"\u00d7{count} Dense layers"
 
 
@@ -1899,23 +2083,45 @@ def _compute_metadata(cfg: Dict[str, Any],
     is_mla = (kv_lora is not None and kv_lora > 0) or any(
         "MLA" in t for t in trace_child_types
     )
+    _moe_re = re.compile(r"moe|fusedmoe|expert", re.IGNORECASE)
     has_moe = n_routed > 0 or any(
-        "MoE" in t or "FusedMoE" in t or "Expert" in t
-        for t in trace_child_types
+        _moe_re.search(t) for t in trace_child_types
     )
     context_k = max_pos // 1000 if max_pos else 0
 
-    # Count dense / moe layers from the groups
+    # Count dense / moe layers from the groups.
+    # Also collect all grandchild types for MoE/MLA detection (the direct
+    # children of raw_root are decoder layers whose names may not contain
+    # "MoE" — the MoE modules are one level deeper).
     dense_count = 0
     moe_count = 0
-    for grp in layer_groups:
-        # Support both 3-tuple and 4-tuple (with representative children)
-        _, cnt, child_types = grp[0], grp[1], grp[2]
+    all_group_child_types: set = set()
+
+    def _flat_groups(raw):
+        """Yield (layer_type, count, child_types) from raw groups,
+        expanding composite groups into their sub-groups with correct
+        total counts."""
+        for grp in raw:
+            if grp[0] == "__composite__":
+                n_repeats = grp[1]
+                for sg_type, sg_cnt, sg_cts, _ in grp[4]:
+                    yield sg_type, sg_cnt * n_repeats, sg_cts
+            else:
+                yield grp[0], grp[1], grp[2]
+
+    for _, cnt, child_types in _flat_groups(layer_groups):
+        all_group_child_types.update(child_types)
         cats = {classify_module_category(t) for t in child_types}
         if "moe_router" in cats or "expert_pool" in cats:
             moe_count += cnt
         else:
             dense_count += cnt
+
+    # Enrich has_moe / is_mla from grandchild types (inside decoder layers)
+    has_moe = has_moe or any(
+        _moe_re.search(t) for t in all_group_child_types
+    )
+    is_mla = is_mla or any("MLA" in t for t in all_group_child_types)
 
     # Fallback to config if trace didn't reveal groups
     if not layer_groups and total_layers:
@@ -1929,8 +2135,11 @@ def _compute_metadata(cfg: Dict[str, Any],
 
     meta: Dict[str, str] = {}
     meta["Type"] = "MoE" if has_moe else "Dense"
+    trace_total = dense_count + moe_count
     if dense_count and moe_count:
         meta["Layers"] = f"{dense_count}D+{moe_count}M"
+    elif trace_total:
+        meta["Layers"] = str(trace_total)
     elif total_layers:
         meta["Layers"] = str(total_layers)
     meta["Attention"] = "MLA" if is_mla else "MHA"
@@ -2055,22 +2264,47 @@ def module_tree_to_arch_template(raw_root, classes, cfg,
 
     # Build layer groups
     layer_group_defs: List[LayerGroupDef] = []
-    for layer_type, count, child_types, repr_children in layer_groups_raw:
-        group_label = _classify_group_label(child_types, count)
-        blocks = _children_to_blocks(child_types, cfg,
-                                     trace_children=repr_children,
-                                     cpu_ops=cpu_ops)
-        layer_group_defs.append(LayerGroupDef(
-            count=count, label=group_label, blocks=blocks,
-        ))
+    for grp in layer_groups_raw:
+        if grp[0] == "__composite__":
+            # Composite pattern: (sentinel, n_repeats, merged_cts, repr_ch, sub_groups)
+            _, n_repeats, merged_cts, _, sub_groups = grp
+            sub_descs = []
+            all_blocks: List[SemanticBlock] = []
+            for sg_type, sg_cnt, sg_cts, sg_repr in sub_groups:
+                # Short name for the sub-group: use humanized layer type
+                sg_cat = classify_module_category(sg_type)
+                sg_human = _humanize_module_type(sg_type, sg_cat)
+                if sg_human == sg_type:
+                    sg_human = sg_type.split("DecoderLayer")[0] if "DecoderLayer" in sg_type else sg_type
+                sub_descs.append(f"{sg_cnt}\u00d7{sg_human}")
+                sg_blocks = _children_to_blocks(sg_cts, cfg,
+                                                trace_children=sg_repr,
+                                                cpu_ops=cpu_ops)
+                all_blocks.extend(sg_blocks)
+            pattern_desc = " + ".join(sub_descs)
+            group_label = f"\u00d7{n_repeats} [{pattern_desc}]"
+            layer_group_defs.append(LayerGroupDef(
+                count=n_repeats, label=group_label, blocks=all_blocks,
+            ))
+        else:
+            layer_type, count, child_types, repr_children = grp
+            group_label = _classify_group_label(child_types, count,
+                                                  layer_type=layer_type)
+            blocks = _children_to_blocks(child_types, cfg,
+                                         trace_children=repr_children,
+                                         cpu_ops=cpu_ops)
+            layer_group_defs.append(LayerGroupDef(
+                count=count, label=group_label, blocks=blocks,
+            ))
 
     # Fallback: use config-derived layer groups when trace has none
     if not layer_group_defs:
         total_layers = cfg.get("num_hidden_layers", 0)
         first_k = cfg.get("first_k_dense_replace", 0)
         n_routed = cfg.get("n_routed_experts") or cfg.get("num_experts", 0)
+        _moe_pat = re.compile(r"moe|fusedmoe|expert", re.IGNORECASE)
         has_moe = n_routed > 0 or any(
-            "MoE" in t or "FusedMoE" in t for t in trace_child_types
+            _moe_pat.search(t) for t in trace_child_types
         )
         if total_layers:
             if has_moe and first_k:
@@ -2123,10 +2357,18 @@ def module_tree_to_arch_template(raw_root, classes, cfg,
             annotation=lm_ann,
         ))
 
-    # Collect trace-derived MoE shapes for metadata (top_k, n_routed, n_experts)
+    # Collect trace-derived MoE shapes for metadata (top_k, n_routed, n_experts).
+    # Flatten composite groups to iterate over their sub-groups too.
+    def _iter_raw_groups(raw):
+        for grp in raw:
+            if grp[0] == "__composite__":
+                yield from grp[4]  # sub_groups
+            else:
+                yield grp
+
     _moe_trace_shapes: Dict[str, Any] = {}
     if cpu_ops:
-        for _lt, _cnt, _cts, _repr_ch in layer_groups_raw:
+        for _lt, _cnt, _cts, _repr_ch in _iter_raw_groups(layer_groups_raw):
             cats = {classify_module_category(t) for t in _cts}
             if "moe_router" not in cats and "expert_pool" not in cats:
                 continue
@@ -2200,6 +2442,14 @@ class TraceHierarchyExtractor:
         """Return (raw_root, cpu_op_events) for shape extraction."""
         return self._extract_raw(with_cpu_ops=True)
 
+    @staticmethod
+    def _is_decode_root(root) -> bool:
+        """Heuristic: root is a decode-phase module (CudaGraphReplay, etc.)."""
+        mt = root.module_type
+        if "CudaGraphReplay" in mt:
+            return True
+        return False
+
     def _extract_raw(self, with_cpu_ops=False):
         from trace_module_analyzer import ModuleTreeBuilder, TraceModuleAnalyzer
 
@@ -2216,12 +2466,67 @@ class TraceHierarchyExtractor:
         roots = builder.build_from_module_events(module_events)
         if not roots:
             return None, []
-        best_root = max(roots, key=lambda r: r.end - r.ts)
+
+        # Find the model body root (the largest non-decode root, typically
+        # *ForCausalLM or *Model) to anchor the first prefill iteration.
+        non_decode = [r for r in roots if not self._is_decode_root(r)]
+        if not non_decode:
+            return None, []
+        model_root = max(non_decode, key=lambda r: r.end - r.ts)
+
+        # Collect the first prefill iteration's roots.
+        # Strategy: find the first occurrence of the model body type.
+        # - Roots before its ts are pre-model (embedding) — take one each.
+        # - The model root itself provides the decoder layers.
+        # - Roots after its end but before the second model root are
+        #   post-model (logits, sampler) — take one each.
+        model_type = model_root.module_type
+        model_occurrences = sorted(
+            [r for r in roots if r.module_type == model_type],
+            key=lambda r: r.ts,
+        )
+        first_model = model_occurrences[0]
+        second_model_ts = (model_occurrences[1].ts
+                           if len(model_occurrences) > 1 else float("inf"))
+
+        # Pre-model siblings: one of each type, starting before the model
+        seen_pre: set = set()
+        pre_roots = []
+        for r in sorted(non_decode, key=lambda r: r.ts):
+            if r.ts >= first_model.ts:
+                break
+            if r.module_type not in seen_pre:
+                seen_pre.add(r.module_type)
+                pre_roots.append(r)
+
+        # Post-model siblings: one of each type, between model end and
+        # the next model start.  Also stop if we see a pre-model type again
+        # (signals the start of the next iteration, e.g. VocabParallelEmbedding).
+        seen_post: set = set()
+        post_roots = []
+        for r in sorted(non_decode, key=lambda r: r.ts):
+            if r.ts < first_model.end:
+                continue
+            if r.ts >= second_model_ts:
+                break
+            if r.module_type in seen_pre:
+                break
+            if r.module_type not in seen_post:
+                seen_post.add(r.module_type)
+                post_roots.append(r)
+
+        first_iter_roots = pre_roots + [first_model] + post_roots
+
+        # Build a virtual root that wraps all first-iteration roots.
+        if len(first_iter_roots) > 1:
+            virtual_root = self._build_virtual_root(
+                first_iter_roots, first_model)
+        else:
+            virtual_root = first_model
 
         cpu_ops = []
         if with_cpu_ops:
-            # Collect events with Input Dims on the same thread
-            target_tid = best_root.tid
+            target_tid = first_model.tid
             cpu_ops = [
                 e for e in events
                 if e.get("tid") == target_tid
@@ -2229,7 +2534,46 @@ class TraceHierarchyExtractor:
             ]
             cpu_ops.sort(key=lambda e: e.get("ts", 0))
 
-        return best_root, cpu_ops
+        return virtual_root, cpu_ops
+
+    @staticmethod
+    def _build_virtual_root(first_iter_roots, model_root):
+        """Build a virtual root that wraps first-iteration sibling roots.
+
+        Roots before the model body become header children, the model body's
+        own children are inlined, and roots after become footer children.
+        This gives _trace_layer_groups a single root whose children are:
+          [embedding, ...] + [decoder_layers...] + [norm, logits, sampler, ...]
+        """
+        from dataclasses import dataclass as _dc, field as _field
+
+        header = []
+        footer = []
+        for r in first_iter_roots:
+            if r is model_root:
+                continue
+            if r.ts < model_root.ts:
+                header.append(r)
+            else:
+                footer.append(r)
+
+        combined_children = header + list(model_root.children) + footer
+
+        @_dc
+        class _VirtualRoot:
+            module_type: str
+            children: list
+            ts: float
+            end: float
+            tid: int = 0
+
+        return _VirtualRoot(
+            module_type=model_root.module_type,
+            children=combined_children,
+            ts=model_root.ts,
+            end=model_root.end,
+            tid=getattr(model_root, "tid", 0),
+        )
 
     def _deduplicate(self, node) -> ArchNode:
         category = classify_module_category(node.module_type)
@@ -3156,24 +3500,26 @@ def generate_arch_diagram(trace_path: str, output_png: str,
 
     template = module_tree_to_arch_template(raw_root, classes, cfg,
                                             cpu_ops=cpu_ops)
-    renderer = ArchDiagramRenderer()
 
     logger.info("Auto-generated template for %s", root_type)
-    renderer.render_template_to_png(template, output_png)
 
+    # Write text companion first (lightweight, no external deps)
     base = output_png.rsplit(".", 1)[0]
+    txt_path = base + ".txt"
     if detailed:
-        txt_path = base + ".txt"
         txt = template_to_text(template)
-        with open(txt_path, "w") as f:
-            f.write(txt + "\n")
-        logger.info("Detailed text diagram saved to %s", txt_path)
     else:
-        txt_path = base + ".txt"
         txt = template_to_text_simplified(template)
-        with open(txt_path, "w") as f:
-            f.write(txt + "\n")
-        logger.info("Simplified text diagram saved to %s", txt_path)
+    with open(txt_path, "w") as f:
+        f.write(txt + "\n")
+
+    # Render PNG (requires matplotlib)
+    try:
+        renderer = ArchDiagramRenderer()
+        renderer.render_template_to_png(template, output_png)
+    except ImportError:
+        logger.warning("matplotlib not installed — skipping PNG render")
+        output_png = None
 
     return output_png
 
@@ -3196,12 +3542,16 @@ def arch_diagram_main(trace_path: str,
     print(f"Generating architecture diagram from: {os.path.abspath(trace_path)}")
     result = generate_arch_diagram(trace_path, png_path, config_path=config_path,
                                    detailed=detailed, sglang_path=sglang_path)
-    if result is None:
+
+    txt_path = os.path.join(out_dir, "arch_diagram.txt")
+    if not os.path.isfile(txt_path):
         print("ERROR: Failed to generate diagram.", file=sys.stderr)
         sys.exit(1)
 
-    txt_path = os.path.join(out_dir, "arch_diagram.txt")
-    print(f"  PNG: {os.path.abspath(png_path)}")
+    if result is not None:
+        print(f"  PNG: {os.path.abspath(png_path)}")
+    else:
+        print("  PNG: skipped (matplotlib not available)")
     print(f"  TXT: {os.path.abspath(txt_path)}")
 
 
