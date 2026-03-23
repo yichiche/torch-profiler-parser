@@ -999,48 +999,41 @@ class PhaseDetector:
 # Model info text generator (from trace module roots, no re-load)
 # ---------------------------------------------------------------------------
 
-def _generate_model_info(roots: List[ModuleNode],
-                         png_path: Optional[str] = None
-                         ) -> Tuple[Optional[str], Optional[str]]:
-    """Build architecture diagram text + optional PNG from already-parsed module roots.
+def _generate_model_info_html(xlsx_path: str,
+                              output_html: Optional[str] = None,
+                              serve: bool = False,
+                              port: int = 8765
+                              ) -> Optional[str]:
+    """Generate interactive module tree HTML from an analysis.xlsx using visualize_module_tree.py.
 
-    Returns (text, png_path_or_None).  Reuses the trace's module roots so the
-    trace file is never re-loaded.
+    Returns the output HTML path on success, or None on failure.
+    If serve=True, starts an HTTP server after generating the HTML.
     """
-    if not roots:
-        return None, None
+    if not xlsx_path or not os.path.isfile(xlsx_path):
+        return None
 
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
         if script_dir not in sys.path:
             sys.path.insert(0, script_dir)
-        from model_inspector import (match_template, template_to_text,
-                                     ArchDiagramRenderer)
+        from visualize_module_tree import main as visualize_main
     except ImportError as e:
-        logger.warning("model_inspector not available: %s", e)
-        return None, None
+        logger.warning("visualize_module_tree not available: %s", e)
+        return None
 
-    best_root = max(roots, key=lambda r: r.end - r.ts)
-    root_type = best_root.module_type
+    if output_html is None:
+        output_html = os.path.join(
+            os.path.dirname(os.path.abspath(xlsx_path)) or ".",
+            "module_tree.html")
 
-    template = match_template(root_type, {}, raw_root=best_root)
-    if template is None:
-        logger.info("No arch template for %s, skipping Model Info tab", root_type)
-        return None, None
+    try:
+        visualize_main(xlsx_path, output_html, serve=serve, port=port)
+        if os.path.isfile(output_html):
+            return output_html
+    except Exception as e:
+        logger.warning("Failed to generate module tree HTML: %s", e)
 
-    text = template_to_text(template)
-
-    actual_png = None
-    if png_path:
-        try:
-            renderer = ArchDiagramRenderer()
-            renderer.render_template_to_png(template, png_path)
-            if os.path.isfile(png_path):
-                actual_png = png_path
-        except Exception as e:
-            logger.warning("Failed to render arch diagram PNG: %s", e)
-
-    return text, actual_png
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1329,7 +1322,7 @@ class ReportGenerator:
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
                      output_path: str, max_detail_modules: int = 3,
                      detail_modules: Optional[List[str]] = None,
-                     model_info_roots: Optional[List[ModuleNode]] = None):
+):
         """Export analysis to Excel workbook."""
         try:
             import openpyxl
@@ -1549,31 +1542,8 @@ class ReportGenerator:
             ws_det.column_dimensions["C"].width = 80
             ws_det.column_dimensions["G"].width = 80
 
-        # --- Model Info tab (architecture text + diagram from trace roots) ---
-        tmp_png = None
-        if model_info_roots:
-            png_dir = os.path.dirname(os.path.abspath(output_path))
-            tmp_png = os.path.join(png_dir, "_arch_diagram_tmp.png")
-            model_info_text, png_result = _generate_model_info(
-                model_info_roots,
-                png_path=tmp_png)
-            if model_info_text:
-                self._write_model_info_tab(wb, model_info_text,
-                                           header_font, header_fill,
-                                           png_path=png_result)
-                logger.info("Model Info tab added")
-            else:
-                logger.warning("Could not generate model info "
-                               "(no matching template)")
-
         wb.save(output_path)
         print(f"\nExcel report saved to: {output_path}")
-
-        if tmp_png and os.path.isfile(tmp_png):
-            try:
-                os.unlink(tmp_png)
-            except OSError:
-                pass
 
     @staticmethod
     def _time_stats(times: List[float]) -> Tuple[float, float, float, float, float]:
@@ -1729,39 +1699,6 @@ class ReportGenerator:
         ws.column_dimensions["E"].width = 15
 
         return row
-
-    def _write_model_info_tab(self, wb, model_info_text: str,
-                              header_font, header_fill,
-                              png_path: Optional[str] = None):
-        """Write a 'Model Info' tab: text on the left, arch diagram PNG on the right."""
-        from openpyxl.styles import Font, Alignment
-
-        ws = wb.create_sheet(title="Model Info (WIP)")
-
-        row = 1
-        ws.cell(row=row, column=1, value="Architecture (text)").font = Font(bold=True, size=12)
-        row += 2
-
-        mono_font = Font(name="Courier New", size=9)
-        wrap_align = Alignment(wrap_text=False, vertical="top")
-
-        for line in model_info_text.splitlines():
-            ws.cell(row=row, column=1, value=line).font = mono_font
-            ws.cell(row=row, column=1).alignment = wrap_align
-            row += 1
-
-        ws.column_dimensions["A"].width = 80
-
-        if png_path and os.path.isfile(png_path):
-            try:
-                from openpyxl.drawing.image import Image as XlImage
-                img = XlImage(png_path)
-                ws.cell(row=1, column=3,
-                        value="Architecture (diagram)").font = Font(bold=True, size=12)
-                img.anchor = "C3"
-                ws.add_image(img)
-            except Exception as e:
-                logger.warning("Failed to embed arch diagram PNG: %s", e)
 
     def _write_type_row(self, ws, row: int, label: str, depth: int, count: int,
                         times: List[float], parent_time: float,
@@ -2235,7 +2172,8 @@ class TraceModuleAnalyzer:
                  module_index: Optional[int] = None,
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
-                 model_info: bool = False):
+                 model_info: bool = False,
+                 port: int = 8765):
         self.trace_path = trace_path
         self.output_path = output_path
         self.detail_modules = detail_modules or []
@@ -2243,6 +2181,7 @@ class TraceModuleAnalyzer:
         self.max_detail_modules = max_detail_modules
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
+        self.port = port
 
     def run(self):
         import time as _time
@@ -2417,21 +2356,41 @@ class TraceModuleAnalyzer:
             reporter.print_layer_detail(stats_list, mode, dm,
                                         self.module_index)
 
-        if self.model_info and roots:
-            model_info_text, _ = _generate_model_info(roots)
-            if model_info_text:
-                print("\n" + "=" * 70)
-                print("  Model Info (from model_inspector)")
-                print("=" * 70)
-                print(model_info_text)
-
         print(f"  {_elapsed()} console output done")
-        if self.output_path:
-            reporter.export_excel(stats_list, mode, self.output_path,
+
+        # Determine xlsx path: explicit -o, or auto-generate for --model-info
+        xlsx_path = self.output_path
+        tmp_xlsx = None
+        if not xlsx_path and self.model_info:
+            # Generate a temporary xlsx so visualize_module_tree can read it
+            trace_dir = os.path.dirname(os.path.abspath(self.trace_path))
+            trace_base = os.path.splitext(os.path.basename(self.trace_path))[0]
+            if trace_base.endswith(".json"):
+                trace_base = trace_base[:-5]
+            xlsx_path = os.path.join(trace_dir, f"{trace_base}_analysis.xlsx")
+            tmp_xlsx = xlsx_path
+
+        if xlsx_path:
+            reporter.export_excel(stats_list, mode, xlsx_path,
                                   max_detail_modules=self.max_detail_modules,
-                                  detail_modules=self.detail_modules,
-                                  model_info_roots=roots if self.model_info else None)
+                                  detail_modules=self.detail_modules)
             print(f"  {_elapsed()} excel export done")
+
+        if self.model_info and xlsx_path:
+            html_path = os.path.splitext(xlsx_path)[0] + "_module_tree.html"
+            result = _generate_model_info_html(xlsx_path, html_path,
+                                               serve=True, port=self.port)
+            if result:
+                print(f"\n  Module tree visualization: {result}")
+            else:
+                print("\n  WARNING: Could not generate module tree visualization")
+
+            # Clean up temporary xlsx if we created one
+            if tmp_xlsx and os.path.isfile(tmp_xlsx):
+                try:
+                    os.unlink(tmp_xlsx)
+                except OSError:
+                    pass
 
     def _propagate_phase(self, nodes: List[ModuleNode]):
         """Propagate phase from parent to children if not set."""
@@ -2510,8 +2469,9 @@ Examples:
   # Pick the 5th occurrence instead of the median
   python trace_module_analyzer.py trace.json.gz --detail-module WanTransformerBlock --module-index 5
 
-  # Include a Model Info tab with architecture summary from model_inspector
-  python trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info
+  # Generate interactive module tree HTML and serve it (auto-generates xlsx if no -o)
+  python trace_module_analyzer.py trace.json.gz --model-info
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info --port 9000
 """,
     )
     parser.add_argument("trace_file", help="Path to trace file (.json.gz or .json)")
@@ -2527,8 +2487,10 @@ Examples:
                         help="Which occurrence of the module to show detail for "
                              "(default: the instance closest to the median)")
     parser.add_argument("--model-info", action="store_true",
-                        help="Add a Model Info tab with architecture summary "
-                             "(requires model_inspector.py)")
+                        help="Generate interactive module tree HTML visualization "
+                             "and start HTTP server (requires visualize_module_tree.py)")
+    parser.add_argument("--port", type=int, default=8765,
+                        help="HTTP server port for --model-info (default: 8765)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2556,6 +2518,7 @@ Examples:
             max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,
+            port=args.port,
         )
         analyzer.run()
     except FileNotFoundError as e:
