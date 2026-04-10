@@ -1306,6 +1306,21 @@ class ReportGenerator:
         else:
             wall_time = 0
 
+        # Compute active_time via sorted interval union; idle = wall - active
+        active_time = 0.0
+        if all_details:
+            srt = sorted(all_details, key=lambda d: d.ts)
+            ms, me = srt[0].ts, srt[0].ts + srt[0].duration
+            for d in srt[1:]:
+                s, e = d.ts, d.ts + d.duration
+                if s <= me:
+                    me = max(me, e)
+                else:
+                    active_time += me - ms
+                    ms, me = s, e
+            active_time += me - ms
+        idle_time = max(0.0, wall_time - active_time)
+
         print(f"\n{'='*100}")
         print(f"  Layer Detail: {selected.name}  [{len(all_details)} items]")
         print(f"  Kernel sum: {sum_dur:,.0f} us  |  Wall time: {wall_time:,.0f} us  "
@@ -1334,6 +1349,9 @@ class ReportGenerator:
                 print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname:50s}  {dims}")
             else:
                 print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname}")
+        idle_pct = idle_time / wall_time * 100 if wall_time > 0 else 0
+        print(f"  {'':4s}  {idle_time:13,.1f}  {idle_pct:5.1f}%  {'':>15s}  {'':30s}  idle (gap)")
+        print(f"  {'':4s}  {wall_time:13,.1f}  {'':6s}  {'':>15s}  {'':30s}  wall time (span)")
 
     def _pick_median_instance(self, matches: List[ModuleStats],
                               mode: str) -> Tuple[ModuleStats, str]:
@@ -1755,6 +1773,22 @@ class ReportGenerator:
                 cell.font = header_font
                 cell.fill = header_fill
             cur_row += 1
+            # Compute active_time via sorted interval union (all_details already
+            # sorted by ts above).  idle_time = wall_time - active_time.
+            active_time = 0.0
+            if all_details:
+                merge_start = all_details[0].ts
+                merge_end = all_details[0].ts + all_details[0].duration
+                for d in all_details[1:]:
+                    s, e = d.ts, d.ts + d.duration
+                    if s <= merge_end:
+                        merge_end = max(merge_end, e)
+                    else:
+                        active_time += merge_end - merge_start
+                        merge_start, merge_end = s, e
+                active_time += merge_end - merge_start
+            idle_time = max(0.0, wall_time - active_time)
+
             detail_truncated = len(all_details) > MAX_ROWS_PER_TAB
             for i, d in enumerate(all_details[:MAX_ROWS_PER_TAB], 1):
                 pct = d.duration / wall_time * 100 if wall_time > 0 else 0
@@ -1777,6 +1811,19 @@ class ReportGenerator:
             if detail_truncated:
                 ws_det.cell(row=cur_row, column=1,
                             value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+                cur_row += 1
+            # Idle-gap synthetic row
+            idle_pct = idle_time / wall_time * 100 if wall_time > 0 else 0
+            idle_font = Font(italic=True, color="888888")
+            idle_cell_name = ws_det.cell(row=cur_row, column=3, value="idle (gap)")
+            idle_cell_name.font = idle_font
+            ws_det.cell(row=cur_row, column=4, value=round(idle_time, 1)).font = idle_font
+            ws_det.cell(row=cur_row, column=5, value=round(idle_pct, 1)).font = idle_font
+            cur_row += 1
+            # Wall-time-span footer row
+            span_font = Font(bold=True)
+            ws_det.cell(row=cur_row, column=3, value="wall time (span)").font = span_font
+            ws_det.cell(row=cur_row, column=4, value=round(wall_time, 1)).font = span_font
             ws_det.column_dimensions["A"].width = 35
             ws_det.column_dimensions["B"].width = 60
             ws_det.column_dimensions["C"].width = 80
