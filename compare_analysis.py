@@ -531,57 +531,160 @@ class TabComparison:
     replacements: List[KernelReplacement]
     only_in_base: bool = False
     only_in_target: bool = False
+    base_tab_name: str = ""
+    tgt_tab_name: str = ""
+
+
+def _extract_tab_module(tab_name: str) -> Tuple[str, str, str]:
+    """Extract (base_module, phase, variant) from a detail tab name.
+
+    Examples:
+        'DeepseekV4DecoderLayer (dec,A)' -> ('DeepseekV4DecoderLayer', 'dec', 'A')
+        'DeepseekV4DecoderLayer (A)'     -> ('DeepseekV4DecoderLayer', '',    'A')
+        'Layer (dec)'                    -> ('Layer',                  'dec', '')
+        'Sampler'                        -> ('Sampler',                '',    '')
+    """
+    m = re.match(r'^(.+?)\s*\(([^)]+)\)\s*$', tab_name)
+    if not m:
+        return (tab_name.strip(), '', '')
+    base = m.group(1).strip()
+    parts = [p.strip() for p in m.group(2).split(',')]
+    phase = ''
+    variant = ''
+    for p in parts:
+        if p in ('pre', 'dec', 'prefill', 'decode'):
+            phase = p
+        elif re.match(r'^[A-Z]$', p):
+            variant = p
+        else:
+            phase = p
+    return (base, phase, variant)
+
+
+def _build_tab_comparison(base_tab: str, tgt_tab: str, display_name: str,
+                          base_data: AnalysisData,
+                          target_data: AnalysisData) -> TabComparison:
+    bb = base_data.detail_blocks[base_tab]
+    tb = target_data.detail_blocks[tgt_tab]
+
+    cat_deltas = []
+    all_cats = sorted(set(bb.categories) | set(tb.categories))
+    for cat in all_cats:
+        bv = bb.categories.get(cat, 0)
+        tv = tb.categories.get(cat, 0)
+        if abs(tv - bv) >= 10:
+            cat_deltas.append((cat, bv, tv, tv - bv))
+    cat_deltas.sort(key=lambda x: abs(x[3]), reverse=True)
+
+    all_knames = set(bb.kernels) | set(tb.kernels)
+    k_deltas = []
+    for kn in all_knames:
+        bk = bb.kernels.get(kn)
+        tk = tb.kernels.get(kn)
+        kbt = bk.total_us if bk else 0
+        ktt = tk.total_us if tk else 0
+        kcat = (bk or tk).category
+        k_deltas.append((kn, kcat, kbt, ktt, ktt - kbt))
+    k_deltas.sort(key=lambda x: abs(x[4]), reverse=True)
+
+    base_agg = _detail_kernels_to_agg(bb.kernels)
+    tgt_agg = _detail_kernels_to_agg(tb.kernels)
+    reps = _detect_replacements(base_agg, tgt_agg)
+
+    return TabComparison(
+        tab_name=display_name,
+        base_kernel_sum_us=bb.kernel_sum_us,
+        tgt_kernel_sum_us=tb.kernel_sum_us,
+        delta_us=tb.kernel_sum_us - bb.kernel_sum_us,
+        category_deltas=cat_deltas,
+        kernel_deltas=k_deltas,
+        replacements=reps,
+        base_tab_name=base_tab,
+        tgt_tab_name=tgt_tab,
+    )
 
 
 def _compare_tabs(base: AnalysisData, target: AnalysisData) -> List[TabComparison]:
-    """Compare detail blocks (tabs) that share the same name across both files."""
+    """Compare detail blocks (tabs) across both files, matching by module type.
+
+    Matching strategy (in priority order):
+      1. Exact tab name match.
+      2. Same base module + same variant letter (ignoring phase suffix differences).
+      3. Same base module, 1:1 on each side (no variant letters).
+    """
     base_tabs = set(base.detail_blocks)
     tgt_tabs = set(target.detail_blocks)
-    common = sorted(base_tabs & tgt_tabs)
-    only_base = sorted(base_tabs - tgt_tabs)
-    only_tgt = sorted(tgt_tabs - base_tabs)
 
+    matched_base: set = set()
+    matched_tgt: set = set()
     results: List[TabComparison] = []
 
-    for tab in common:
-        bb = base.detail_blocks[tab]
-        tb = target.detail_blocks[tab]
+    # Pass 1: exact name match
+    for tab in sorted(base_tabs & tgt_tabs):
+        tc = _build_tab_comparison(tab, tab, tab, base, target)
+        results.append(tc)
+        matched_base.add(tab)
+        matched_tgt.add(tab)
 
-        cat_deltas = []
-        all_cats = sorted(set(bb.categories) | set(tb.categories))
-        for cat in all_cats:
-            bv = bb.categories.get(cat, 0)
-            tv = tb.categories.get(cat, 0)
-            if abs(tv - bv) >= 10:
-                cat_deltas.append((cat, bv, tv, tv - bv))
-        cat_deltas.sort(key=lambda x: abs(x[3]), reverse=True)
+    # Pass 2: match by (base_module, variant), ignoring phase differences
+    remaining_base = sorted(base_tabs - matched_base)
+    remaining_tgt = sorted(tgt_tabs - matched_tgt)
 
-        all_knames = set(bb.kernels) | set(tb.kernels)
-        k_deltas = []
-        for kn in all_knames:
-            bk = bb.kernels.get(kn)
-            tk = tb.kernels.get(kn)
-            kbt = bk.total_us if bk else 0
-            ktt = tk.total_us if tk else 0
-            kcat = (bk or tk).category
-            k_deltas.append((kn, kcat, kbt, ktt, ktt - kbt))
-        k_deltas.sort(key=lambda x: abs(x[4]), reverse=True)
+    tgt_by_mod: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+    for tab in remaining_tgt:
+        bmod, _, variant = _extract_tab_module(tab)
+        tgt_by_mod[(bmod, variant)].append(tab)
 
-        base_agg = _detail_kernels_to_agg(bb.kernels)
-        tgt_agg = _detail_kernels_to_agg(tb.kernels)
-        reps = _detect_replacements(base_agg, tgt_agg)
+    still_unmatched_base = []
+    for btab in remaining_base:
+        bmod, _, bvariant = _extract_tab_module(btab)
+        candidates = tgt_by_mod.get((bmod, bvariant), [])
+        candidates = [c for c in candidates if c not in matched_tgt]
+        if candidates:
+            ttab = candidates[0]
+            display = btab if btab == ttab else f"{bmod}" + (f" ({bvariant})" if bvariant else "")
+            tc = _build_tab_comparison(btab, ttab, display, base, target)
+            results.append(tc)
+            matched_base.add(btab)
+            matched_tgt.add(ttab)
+        else:
+            still_unmatched_base.append(btab)
 
-        results.append(TabComparison(
-            tab_name=tab,
-            base_kernel_sum_us=bb.kernel_sum_us,
-            tgt_kernel_sum_us=tb.kernel_sum_us,
-            delta_us=tb.kernel_sum_us - bb.kernel_sum_us,
-            category_deltas=cat_deltas,
-            kernel_deltas=k_deltas,
-            replacements=reps,
-        ))
+    # Pass 3: match by base_module alone when both sides have exactly one
+    # unmatched tab for that module
+    remaining_tgt2 = sorted(tgt_tabs - matched_tgt)
+    base_by_mod: Dict[str, List[str]] = defaultdict(list)
+    tgt_by_mod2: Dict[str, List[str]] = defaultdict(list)
+    for tab in still_unmatched_base:
+        bmod, _, _ = _extract_tab_module(tab)
+        base_by_mod[bmod].append(tab)
+    for tab in remaining_tgt2:
+        bmod, _, _ = _extract_tab_module(tab)
+        tgt_by_mod2[bmod].append(tab)
 
-    for tab in only_base:
+    for bmod in sorted(base_by_mod):
+        btabs = [t for t in base_by_mod[bmod] if t not in matched_base]
+        ttabs = [t for t in tgt_by_mod2.get(bmod, []) if t not in matched_tgt]
+        if not btabs or not ttabs:
+            continue
+        # Sort target tabs so variant A (dominant) comes first
+        ttabs.sort(key=lambda t: _extract_tab_module(t)[2] or '')
+        if len(btabs) == 1 and len(ttabs) >= 1:
+            btab, ttab = btabs[0], ttabs[0]
+            tc = _build_tab_comparison(btab, ttab, bmod, base, target)
+            results.append(tc)
+            matched_base.add(btab)
+            matched_tgt.add(ttab)
+        elif len(btabs) >= 1 and len(ttabs) == 1:
+            btabs.sort(key=lambda t: _extract_tab_module(t)[2] or '')
+            btab, ttab = btabs[0], ttabs[0]
+            tc = _build_tab_comparison(btab, ttab, bmod, base, target)
+            results.append(tc)
+            matched_base.add(btab)
+            matched_tgt.add(ttab)
+
+    # Unmatched remainders
+    for tab in sorted(base_tabs - matched_base):
         bb = base.detail_blocks[tab]
         results.append(TabComparison(
             tab_name=tab,
@@ -589,9 +692,10 @@ def _compare_tabs(base: AnalysisData, target: AnalysisData) -> List[TabCompariso
             delta_us=-bb.kernel_sum_us,
             category_deltas=[], kernel_deltas=[], replacements=[],
             only_in_base=True,
+            base_tab_name=tab,
         ))
 
-    for tab in only_tgt:
+    for tab in sorted(tgt_tabs - matched_tgt):
         tb = target.detail_blocks[tab]
         results.append(TabComparison(
             tab_name=tab,
@@ -599,6 +703,7 @@ def _compare_tabs(base: AnalysisData, target: AnalysisData) -> List[TabCompariso
             delta_us=tb.kernel_sum_us,
             category_deltas=[], kernel_deltas=[], replacements=[],
             only_in_target=True,
+            tgt_tab_name=tab,
         ))
 
     results.sort(key=lambda t: abs(t.delta_us), reverse=True)
@@ -742,7 +847,11 @@ def print_report(base: AnalysisData, target: AnalysisData,
 
         for tc in matched_tabs:
             tc_color = _color_delta(tc.delta_us)
-            print(f"  {_BOLD}{tc.tab_name}{_RESET}  "
+            tab_label = tc.tab_name
+            if (tc.base_tab_name and tc.tgt_tab_name
+                    and tc.base_tab_name != tc.tgt_tab_name):
+                tab_label = f"{tc.base_tab_name} ↔ {tc.tgt_tab_name}"
+            print(f"  {_BOLD}{tab_label}{_RESET}  "
                   f"{_fmt_us(tc.base_kernel_sum_us)} → {_fmt_us(tc.tgt_kernel_sum_us)}  "
                   f"{tc_color}{_BOLD}{_fmt_delta(tc.delta_us, tc.base_kernel_sum_us)}{_RESET}")
 
@@ -1333,7 +1442,11 @@ def write_excel(base: AnalysisData, target: AnalysisData,
                 row += 1
                 continue
 
-            ws_tab.cell(row=row, column=1, value=tc.tab_name).font = _BOLD_FONT
+            tab_label = tc.tab_name
+            if (tc.base_tab_name and tc.tgt_tab_name
+                    and tc.base_tab_name != tc.tgt_tab_name):
+                tab_label = f"{tc.base_tab_name} ↔ {tc.tgt_tab_name}"
+            ws_tab.cell(row=row, column=1, value=tab_label).font = _BOLD_FONT
             ws_tab.cell(row=row, column=4, value=round(tc.base_kernel_sum_us, 1))
             ws_tab.cell(row=row, column=5, value=round(tc.tgt_kernel_sum_us, 1))
             ws_tab.cell(row=row, column=6, value=round(tc.delta_us, 1))
