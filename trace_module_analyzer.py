@@ -1337,19 +1337,19 @@ class ReportGenerator:
 
     def _pick_median_instance(self, matches: List[ModuleStats],
                               mode: str) -> Tuple[ModuleStats, str]:
-        """Pick the instance closest to the median total time."""
-        if len(matches) == 1:
-            return matches[0], f"only instance (id={matches[0].instance_id})"
+        """Pick the instance at the median position by total time.
 
-        timed = [(m.total_kernel_time if mode == "full" else m.total_cpu_op_time, m)
-                 for m in matches]
-        timed.sort(key=lambda x: x[0])
-        mid = len(timed) // 2
-        median_val = timed[mid][0]
-        # Find closest to median
-        best = min(timed, key=lambda x: abs(x[0] - median_val))
-        return best[1], (f"closest to median (id={best[1].instance_id}, "
-                         f"{best[0]:,.0f} us, median={median_val:,.0f} us)")
+        Deduplicates by instance_id first so median reflects unique layers,
+        not repeated forward passes.
+        """
+        deduped = self._dedup_by_instance_id(matches, mode)
+        if len(deduped) == 1:
+            return deduped[0], f"only instance (id={deduped[0].instance_id})"
+        mid = len(deduped) // 2
+        pick = deduped[mid]
+        t = pick.total_kernel_time if mode == "full" else pick.total_cpu_op_time
+        return pick, (f"median position (id={pick.instance_id}, "
+                      f"{t:,.0f} us, pos {mid+1}/{len(deduped)})")
 
     def _find_modules(self, stats_list: List[ModuleStats], module_type: str,
                       out: List[ModuleStats]):
@@ -1605,18 +1605,51 @@ class ReportGenerator:
                 for s in x[1]))
         type_row = 2
         for rtype, rlist in sorted_root_types:
-            root_times = [(s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
-                          for s in rlist]
-            rep = next((s for s in rlist if s.instance_id == 1), rlist[0])
-            rep_time = rep.total_kernel_time if mode == "full" else rep.total_cpu_op_time
-            root_rep_kernel = self._get_rep_kernel(rep, mode)
-            self._write_type_row(ws_ov, type_row, rtype, 0, len(rlist),
-                                 root_times, grand_total, bold=True,
-                                 rep_kernel=root_rep_kernel)
-            type_row += 1
-            if rep.children_stats:
-                type_row, _ = self._write_children_hierarchy(
-                    ws_ov, rep, mode, type_row, rep_time, rlist)
+            # Detect structural variants among root instances
+            _sig_groups: Dict[frozenset, List[ModuleStats]] = defaultdict(list)
+            for s in rlist:
+                _sig_groups[self._children_signature(s)].append(s)
+            # Filter to significant variants (>= 10% of total instances)
+            min_count = max(1, len(rlist) // 10)
+            sig_variants = {k: v for k, v in _sig_groups.items()
+                            if len(v) >= min_count}
+            if not sig_variants:
+                sig_variants = _sig_groups
+            if len(sig_variants) <= 1:
+                root_times = [(s.total_kernel_time if mode == "full"
+                               else s.total_cpu_op_time) for s in rlist]
+                rep = next((s for s in rlist if s.instance_id == 1), rlist[0])
+                rep_time = (rep.total_kernel_time if mode == "full"
+                            else rep.total_cpu_op_time)
+                root_rep_kernel = self._get_rep_kernel(rep, mode)
+                self._write_type_row(ws_ov, type_row, rtype, 0, len(rlist),
+                                     root_times, grand_total, bold=True,
+                                     rep_kernel=root_rep_kernel)
+                type_row += 1
+                if rep.children_stats:
+                    type_row, _ = self._write_children_hierarchy(
+                        ws_ov, rep, mode, type_row, rep_time, rlist)
+            else:
+                sorted_variants = sorted(
+                    sig_variants.values(), key=lambda g: -len(g))
+                for vi, vlist in enumerate(sorted_variants):
+                    vlabel = chr(ord('A') + vi)
+                    vtimes = [(s.total_kernel_time if mode == "full"
+                               else s.total_cpu_op_time) for s in vlist]
+                    deduped_v = self._dedup_by_instance_id(vlist, mode)
+                    vrep = deduped_v[len(deduped_v) // 2]
+                    vrep_time = (vrep.total_kernel_time if mode == "full"
+                                 else vrep.total_cpu_op_time)
+                    vrep_kernel = self._get_rep_kernel(vrep, mode)
+                    vlbl = f"{rtype} ({vlabel}: {vrep.name})"
+                    self._write_type_row(
+                        ws_ov, type_row, vlbl, 0, len(vlist),
+                        vtimes, grand_total, bold=True,
+                        rep_kernel=vrep_kernel)
+                    type_row += 1
+                    if vrep.children_stats:
+                        type_row, _ = self._write_children_hierarchy(
+                            ws_ov, vrep, mode, type_row, vrep_time, vlist)
         ws_ov.column_dimensions["A"].width = 40
         ws_ov.column_dimensions["J"].width = 80
 
@@ -1663,23 +1696,64 @@ class ReportGenerator:
         # Seed detail-sheet representatives from the Module Tree instances so
         # that the detail tab numbers match the tree.  _find_median_instance
         # only fills types not already present.
-        seen_types: Dict[Tuple[str, str], ModuleStats] = {}
+        seen_types: Dict[Tuple[str, str, frozenset], ModuleStats] = {}
+        seen_tree_types = set()
+        root_module_types = {s.module_type for s in stats_list}
         for s in stats_list:
-            if s.module_type in seen_tree_roots:
-                self._collect_tree_instances(s, seen_types)
-                break  # only the first root was written to the tree
+            if (s.module_type, s.instance_id) in seen_tree_roots:
+                self._collect_tree_instances(s, seen_types,
+                                            skip_types=root_module_types)
+                seen_tree_types.add(s.module_type)
         self._find_median_instance_per_type(stats_list, seen_types, mode,
                                             force_types=top_type_names)
+        # Assign variant labels when a (type, phase) has multiple significant
+        # signatures (>= 10% of phase instances).  Rare variants are merged
+        # into the closest major variant's detail sheet.
+        variant_labels: Dict[Tuple[str, str, frozenset], str] = {}
+        _vgroups: Dict[Tuple[str, str], List[frozenset]] = defaultdict(list)
+        for mtype, phase, sig in seen_types:
+            _vgroups[(mtype, phase)].append(sig)
+        all_by_type_for_sig: Dict[str, List[ModuleStats]] = defaultdict(list)
+        self._collect_instances_by_type(stats_list, all_by_type_for_sig)
+        _rare_sigs: set = set()
+        for (mtype, phase), sigs in _vgroups.items():
+            if len(sigs) <= 1:
+                continue
+            phase_instances = [s for s in all_by_type_for_sig.get(mtype, [])
+                               if getattr(s, "phase", "") == phase]
+            sig_counts: Dict[frozenset, int] = defaultdict(int)
+            for s in phase_instances:
+                sig_counts[self._children_signature(s)] += 1
+            total_count = len(phase_instances)
+            min_count = max(1, total_count // 10)
+            significant = [sg for sg in sigs if sig_counts.get(sg, 0) >= min_count]
+            for sg in sigs:
+                if sg not in significant:
+                    _rare_sigs.add((mtype, phase, sg))
+            if len(significant) <= 1:
+                continue
+            ordered = sorted(significant, key=lambda sg: -sig_counts.get(sg, 0))
+            for i, sg in enumerate(ordered):
+                variant_labels[(mtype, phase, sg)] = chr(ord('A') + i)
+        # Remove rare variants from seen_types so they don't get detail sheets
+        for key in _rare_sigs:
+            seen_types.pop(key, None)
         # Sort detail tabs by total kernel time descending (highest % first)
         sorted_detail_items = sorted(
             seen_types.items(),
             key=lambda item: -type_total_time.get(item[0][0], 0))
-        for (mtype, phase), rep_stats in sorted_detail_items:
+        for (mtype, phase, sig), rep_stats in sorted_detail_items:
             if mtype not in top_type_names:
                 continue
-            # Include phase suffix in sheet name for LLM traces
+            # Build sheet name with phase and variant suffixes
+            vlabel = variant_labels.get((mtype, phase, sig), "")
+            suffixes = []
             if phase:
-                suffix = f" ({phase[:3]})"  # "prefill" -> "(pre)", "decode" -> "(dec)"
+                suffixes.append(phase[:3])
+            if vlabel:
+                suffixes.append(vlabel)
+            if suffixes:
+                suffix = f" ({','.join(suffixes)})"
                 sheet_name = f"{mtype[:28 - len(suffix)]}{suffix}"
             else:
                 sheet_name = mtype[:28]  # Excel sheet name limit = 31 chars
@@ -2305,54 +2379,99 @@ class ReportGenerator:
         return chain
 
     @staticmethod
+    def _children_signature(stats: ModuleStats, depth: int = 2) -> frozenset:
+        """Structural fingerprint from children module types (recursive to *depth*).
+
+        Depth=2 captures grandchildren, so e.g. DeepseekV4DecoderLayer
+        instances whose MQALayer children differ (C4Indexer vs Compressor)
+        produce different signatures.
+        """
+        if depth <= 0 or not stats.children_stats:
+            return frozenset()
+        from collections import Counter
+        child_sigs = Counter()
+        for c in stats.children_stats:
+            sub = ReportGenerator._children_signature(c, depth - 1)
+            child_sigs[(c.module_type, sub)] += 1
+        return frozenset(child_sigs.items())
+
+    @staticmethod
     def _collect_tree_instances(root_stats: ModuleStats,
-                                out: Dict[Tuple[str, str], ModuleStats]):
-        """Collect first instance of each (module_type, phase) from a tree.
+                                out: Dict[Tuple[str, str, frozenset], ModuleStats],
+                                skip_types: Optional[set] = None):
+        """Collect first instance of each (module_type, phase, signature) from a tree.
 
         Walks the same tree that _write_tree_rows renders in the Module Tree
-        tab, recording the first instance per (type, phase) pair.  These are
-        used to seed the detail-sheet representatives so that detail tabs
-        show the exact same instances visible in the tree.
+        tab, recording the first instance per (type, phase, structure) triple.
+        These are used to seed the detail-sheet representatives so that detail
+        tabs show the exact same instances visible in the tree.
+
+        skip_types: module types to skip seeding (let median selection handle
+        them instead — used for root-level types with many instances).
+
+        Skips children of CudaGraphReplay nodes — those are synthetic layers
+        where ordering is arbitrary; median selection picks better reps.
         """
-        key = (root_stats.module_type, getattr(root_stats, "phase", ""))
-        if key not in out and root_stats.kernel_count > 0:
-            out[key] = root_stats
+        if not (skip_types and root_stats.module_type in skip_types):
+            sig = ReportGenerator._children_signature(root_stats)
+            key = (root_stats.module_type, getattr(root_stats, "phase", ""), sig)
+            if key not in out and root_stats.kernel_count > 0:
+                out[key] = root_stats
+        if root_stats.module_type.startswith("CudaGraphReplay"):
+            return
         for child in root_stats.children_stats:
-            ReportGenerator._collect_tree_instances(child, out)
+            ReportGenerator._collect_tree_instances(child, out, skip_types)
+
+    @staticmethod
+    def _dedup_by_instance_id(instances: List[ModuleStats],
+                              mode: str) -> List[ModuleStats]:
+        """Keep one instance per unique instance_id (the one with most kernels)."""
+        best: Dict[int, ModuleStats] = {}
+        for s in instances:
+            prev = best.get(s.instance_id)
+            if prev is None or s.kernel_count > prev.kernel_count:
+                best[s.instance_id] = s
+        return sorted(best.values(), key=lambda s: s.instance_id)
 
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
-                                       seen: Dict[Tuple[str, str], ModuleStats],
+                                       seen: Dict[Tuple[str, str, frozenset], ModuleStats],
                                        mode: str,
                                        force_types: Optional[set] = None):
-        """Find median instance of each (module_type, phase) pair.
+        """Find median instance of each (module_type, phase, signature) triple.
 
-        Groups by (module_type, phase) so that prefill and decode get separate
-        representative instances, producing separate detail sheets.
-        Skips (type, phase) pairs already present in *seen* (e.g. seeded
-        from the Module Tree) so that detail tabs stay consistent with
-        the tree.
+        Groups by (module_type, phase) then sub-groups by structural signature
+        so that structurally different instances (e.g. layers with C4Indexer vs
+        Compressor) get separate representative instances and detail sheets.
+
+        Within each group, deduplicates by instance_id (keeping the instance
+        with the most kernels) so that median position reflects unique layers
+        rather than repeated forward passes.
+
+        Skips triples already present in *seen* (e.g. seeded from Module Tree).
 
         force_types: if given, always include these types even if they are leaf modules.
         """
-        # First collect all instances per type
         all_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
         self._collect_instances_by_type(stats_list, all_by_type)
-        # Pick median for each (type, phase) pair
         for mtype, instances in all_by_type.items():
             if not any(s.children_stats for s in instances):
                 if not (force_types and mtype in force_types):
                     continue
-            # Sub-group by phase
             by_phase: Dict[str, List[ModuleStats]] = defaultdict(list)
             for s in instances:
                 by_phase[getattr(s, "phase", "")].append(s)
             for phase, phase_instances in by_phase.items():
-                if (mtype, phase) in seen:
-                    continue
-                timed = sorted(phase_instances,
-                               key=lambda s: s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
-                mid = len(timed) // 2
-                seen[(mtype, phase)] = timed[mid]
+                by_sig: Dict[frozenset, List[ModuleStats]] = defaultdict(list)
+                for s in phase_instances:
+                    sig = ReportGenerator._children_signature(s)
+                    by_sig[sig].append(s)
+                for sig, sig_instances in by_sig.items():
+                    key = (mtype, phase, sig)
+                    if key in seen:
+                        continue
+                    deduped = self._dedup_by_instance_id(sig_instances, mode)
+                    mid = len(deduped) // 2
+                    seen[key] = deduped[mid]
 
     def _collect_instances_by_type(self, stats_list: List[ModuleStats],
                                    out: Dict[str, List[ModuleStats]]):
