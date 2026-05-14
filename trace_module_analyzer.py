@@ -1634,10 +1634,10 @@ class ReportGenerator:
         tree_row = 2
         seen_tree_roots: set = set()
         for s in stats_list:
-            # Show one representative instance per root module type
-            if s.module_type in seen_tree_roots:
+            key = (s.module_type, s.instance_id)
+            if key in seen_tree_roots:
                 continue
-            seen_tree_roots.add(s.module_type)
+            seen_tree_roots.add(key)
             tree_row = self._write_tree_rows(ws_tree, s, mode, tree_row, 0)
         ws_tree.column_dimensions["A"].width = 50
         ws_tree.column_dimensions["D"].width = 60
@@ -2110,13 +2110,15 @@ class ReportGenerator:
 
         return self._get_rep_kernel(best_type_rep, mode)
 
+    _TREE_MAX_ROWS = 5000
+
     def _write_tree_rows(self, ws, stats: ModuleStats, mode: str,
                          row: int, depth: int, max_depth: int = 3) -> int:
         """Write tree-structured rows with Excel outline grouping for collapse/expand."""
         if depth > max_depth:
             return row
-        if row > MAX_ROWS_PER_TAB + 1:
-            ws.cell(row=row, column=1, value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+        if row > self._TREE_MAX_ROWS + 1:
+            ws.cell(row=row, column=1, value=f"... truncated at {self._TREE_MAX_ROWS} rows")
             return row + 1
         time_val = stats.total_kernel_time if mode == "full" else stats.total_cpu_op_time
         count = stats.kernel_count if mode == "full" else stats.cpu_op_count
