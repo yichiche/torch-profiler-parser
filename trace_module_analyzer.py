@@ -1382,6 +1382,47 @@ class ReportGenerator:
         if not detail_modules:
             top_type_names, root_chains, type_totals, wrapper_types, type_children_map = \
                 self._select_max_detail_modules(stats_list, mode, max_detail_modules)
+        else:
+            top_type_names = set(detail_modules)
+
+        _, variant_aggregates = self._compute_variant_aggregates(stats_list, mode)
+
+        def _lookup_variants(mtype: str, phase: str):
+            info = variant_aggregates.get((mtype, phase))
+            if info is not None:
+                return info, phase
+            info = variant_aggregates.get((mtype, ""))
+            if info is not None:
+                return info, ""
+            return None, phase
+
+        def _print_variant_rows(parent_indent: str, mtype: str, phase: str):
+            if mtype not in top_type_names:
+                return
+            info, phase_used = _lookup_variants(mtype, phase)
+            if not info:
+                return
+            variants = info["variants"]
+            total_time = info["total_time"]
+            total_count = info["total_count"]
+            labeled_time = sum(vt for (_l, _s, vt, _c) in variants)
+            labeled_count = sum(vc for (_l, _s, _t, vc) in variants)
+            residual_time = max(0.0, total_time - labeled_time)
+            residual_count = max(0, total_count - labeled_count)
+            show_other = (residual_count > 0
+                          and total_time > 0
+                          and residual_time >= total_time * 0.01)
+            total_rows = len(variants) + (1 if show_other else 0)
+            for i, (vlabel, _sig, vtime, vcount) in enumerate(variants):
+                connector = "└── " if i == total_rows - 1 else "├── "
+                vpct = vtime / grand_total * 100 if grand_total > 0 else 0
+                tab = self._format_detail_sheet_name(mtype, phase_used, vlabel)
+                label = f"{parent_indent}    {connector}({vlabel}) {vcount}x"
+                print(f"  {label:<45s} {vtime:>14,.1f} {vpct:>6.1f}%  {tab}")
+            if show_other:
+                vpct = residual_time / grand_total * 100 if grand_total > 0 else 0
+                label = f"{parent_indent}    └── (other) {residual_count}x"
+                print(f"  {label:<45s} {residual_time:>14,.1f} {vpct:>6.1f}%")
 
         # --- Section 1: Kernel Time Summary (with hierarchy) ---
         print("\n" + "=" * 90)
@@ -1406,26 +1447,40 @@ class ReportGenerator:
             pct = rtype_total / grand_total * 100 if grand_total > 0 else 0
             chain = root_chains.get(rtype, [rtype])
             root_phase = self._infer_root_phase(rlist)
-            print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%")
-            if len(chain) > 1:
-                scoped_totals: Dict[str, float] = defaultdict(float)
-                self._collect_by_type_total(rlist, scoped_totals, mode)
-                children = chain[1:]
-                for i, ctype in enumerate(children):
-                    is_last = (i == len(children) - 1)
-                    connector = "└── " if is_last else "├── "
-                    ct = scoped_totals.get(ctype, 0)
-                    ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
-                    label = f"    {connector}{ctype}"
-                    if ctype in top_type_names:
-                        if root_phase:
-                            suffix = f" ({root_phase[:3]})"
-                            tab = f"{ctype[:28 - len(suffix)]}{suffix}"
-                        else:
-                            tab = ctype[:28]
+            root_tab = ""
+            if rtype in top_type_names and len(chain) == 1:
+                root_info, root_phase_used = _lookup_variants(rtype, root_phase)
+                if root_info:
+                    root_tab = self._format_detail_sheet_name(
+                        rtype, root_phase_used, root_info["variants"][0][0])
+                else:
+                    root_tab = self._format_detail_sheet_name(
+                        rtype, root_phase, "")
+            print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%  {root_tab}")
+            if len(chain) == 1:
+                _print_variant_rows("", rtype, root_phase)
+                continue
+            scoped_totals: Dict[str, float] = defaultdict(float)
+            self._collect_by_type_total(rlist, scoped_totals, mode)
+            children = chain[1:]
+            for i, ctype in enumerate(children):
+                is_last = (i == len(children) - 1)
+                connector = "└── " if is_last else "├── "
+                ct = scoped_totals.get(ctype, 0)
+                ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
+                label = f"    {connector}{ctype}"
+                tab = ""
+                if ctype in top_type_names:
+                    child_info, child_phase_used = _lookup_variants(
+                        ctype, root_phase)
+                    if child_info:
+                        tab = self._format_detail_sheet_name(
+                            ctype, child_phase_used, child_info["variants"][0][0])
                     else:
-                        tab = ""
-                    print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
+                        tab = self._format_detail_sheet_name(
+                            ctype, root_phase, "")
+                print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
+                _print_variant_rows("    ", ctype, root_phase)
 
         # --- Section 2: Category breakdown ---
         global_cat_agg: Dict[str, List] = {}
@@ -1575,6 +1630,12 @@ class ReportGenerator:
             top_type_names, _, _, _, _ = \
                 self._select_max_detail_modules(stats_list, mode, max_detail_modules)
 
+        # Pre-compute A/B/C structural variants per (module_type, phase). These
+        # drive both the Summary tab's variant rows and the per-variant detail
+        # sheets so that labels stay consistent.
+        variant_labels, variant_aggregates = self._compute_variant_aggregates(
+            stats_list, mode)
+
         # --- Summary tab (one-pager overview) ---
         ws_summary = wb.active
         ws_summary.title = "Summary"
@@ -1582,7 +1643,7 @@ class ReportGenerator:
             ws_summary, stats_list, mode, grand_total,
             total_kernel_count, global_cat_agg,
             header_font, header_fill, title_font,
-            top_type_names)
+            top_type_names, variant_aggregates)
 
         # --- Overview sheet (hierarchical type tree, with % of Parent + stats) ---
         ws_ov = wb.create_sheet(title="Overview")
@@ -1706,37 +1767,22 @@ class ReportGenerator:
                 seen_tree_types.add(s.module_type)
         self._find_median_instance_per_type(stats_list, seen_types, mode,
                                             force_types=top_type_names)
-        # Assign variant labels when a (type, phase) has multiple significant
-        # signatures (>= 10% of phase instances).  Rare variants are merged
-        # into the closest major variant's detail sheet.
-        variant_labels: Dict[Tuple[str, str, frozenset], str] = {}
-        _vgroups: Dict[Tuple[str, str], List[frozenset]] = defaultdict(list)
+        # Drop rare variants (those not in variant_labels for (mtype, phase)
+        # groups that have >= 2 significant variants) so they don't get their
+        # own detail sheet.
+        _grouped_sigs: Dict[Tuple[str, str], List[frozenset]] = defaultdict(list)
         for mtype, phase, sig in seen_types:
-            _vgroups[(mtype, phase)].append(sig)
-        all_by_type_for_sig: Dict[str, List[ModuleStats]] = defaultdict(list)
-        self._collect_instances_by_type(stats_list, all_by_type_for_sig)
-        _rare_sigs: set = set()
-        for (mtype, phase), sigs in _vgroups.items():
-            if len(sigs) <= 1:
-                continue
-            phase_instances = [s for s in all_by_type_for_sig.get(mtype, [])
-                               if getattr(s, "phase", "") == phase]
-            sig_counts: Dict[frozenset, int] = defaultdict(int)
-            for s in phase_instances:
-                sig_counts[self._children_signature(s)] += 1
-            total_count = len(phase_instances)
-            min_count = max(1, total_count // 10)
-            significant = [sg for sg in sigs if sig_counts.get(sg, 0) >= min_count]
+            _grouped_sigs[(mtype, phase)].append(sig)
+        _rare_keys: List[Tuple[str, str, frozenset]] = []
+        for (mtype, phase), sigs in _grouped_sigs.items():
+            if (mtype, phase) not in variant_aggregates:
+                continue  # group has 0 or 1 significant variants — keep all
+            significant_sigs = {v[1] for v in
+                                variant_aggregates[(mtype, phase)]["variants"]}
             for sg in sigs:
-                if sg not in significant:
-                    _rare_sigs.add((mtype, phase, sg))
-            if len(significant) <= 1:
-                continue
-            ordered = sorted(significant, key=lambda sg: -sig_counts.get(sg, 0))
-            for i, sg in enumerate(ordered):
-                variant_labels[(mtype, phase, sg)] = chr(ord('A') + i)
-        # Remove rare variants from seen_types so they don't get detail sheets
-        for key in _rare_sigs:
+                if sg not in significant_sigs:
+                    _rare_keys.append((mtype, phase, sg))
+        for key in _rare_keys:
             seen_types.pop(key, None)
         # Sort detail tabs by total kernel time descending (highest % first)
         sorted_detail_items = sorted(
@@ -1745,18 +1791,8 @@ class ReportGenerator:
         for (mtype, phase, sig), rep_stats in sorted_detail_items:
             if mtype not in top_type_names:
                 continue
-            # Build sheet name with phase and variant suffixes
             vlabel = variant_labels.get((mtype, phase, sig), "")
-            suffixes = []
-            if phase:
-                suffixes.append(phase[:3])
-            if vlabel:
-                suffixes.append(vlabel)
-            if suffixes:
-                suffix = f" ({','.join(suffixes)})"
-                sheet_name = f"{mtype[:28 - len(suffix)]}{suffix}"
-            else:
-                sheet_name = mtype[:28]  # Excel sheet name limit = 31 chars
+            sheet_name = self._format_detail_sheet_name(mtype, phase, vlabel)
             ws_det = wb.create_sheet(title=sheet_name)
             all_details = self._collect_all_details(rep_stats)
             all_details.sort(key=lambda d: d.ts)
@@ -1909,9 +1945,18 @@ class ReportGenerator:
                            grand_total: float, total_kernel_count: int,
                            global_cat_agg: Dict[str, List],
                            header_font, header_fill, title_font,
-                           top_type_names: set):
-        """Write the Summary tab: kernel time summary with detail tabs, category breakdown."""
+                           top_type_names: set,
+                           variant_aggregates: Optional[Dict] = None):
+        """Write the Summary tab: kernel time summary with detail tabs, category breakdown.
+
+        When a (module_type, phase) group has multiple A/B/C structural
+        variants (computed in `_compute_variant_aggregates`), this tab expands
+        the matching row into one sub-row per variant pointing at its
+        dedicated detail sheet.
+        """
         from openpyxl.styles import Font, PatternFill
+
+        variant_aggregates = variant_aggregates or {}
 
         # Build wrapper chains
         root_chains: Dict[str, List[str]] = {}
@@ -1923,6 +1968,77 @@ class ReportGenerator:
                 rtype, wrapper_types, type_children_map, stats_list, mode)
             root_chains[rtype] = chain
         top_type_set = top_type_names
+
+        def _lookup_variants(mtype: str, phase: str):
+            """Look up variants for (mtype, phase) with fallback to empty phase.
+
+            Root-level instances often have empty `phase` (the PhaseDetector
+            only tags children), so variant_aggregates may be keyed under
+            (mtype, "") while Summary's `_infer_root_phase` returns
+            "prefill"/"decode" from the children.  Return (info, phase_used)
+            where info is the aggregate dict and phase_used is what should be
+            passed to `_format_detail_sheet_name` so the referenced sheet name
+            matches what the detail-sheet loop actually creates.
+            """
+            info = variant_aggregates.get((mtype, phase))
+            if info is not None:
+                return info, phase
+            info = variant_aggregates.get((mtype, ""))
+            if info is not None:
+                return info, ""
+            return None, phase
+
+        def _write_variant_rows(parent_indent: str, mtype: str, phase: str):
+            """Emit one indented sub-row per A/B/C variant under a parent row.
+
+            When the labeled variants don't cover the full (mtype, phase)
+            group (rare signatures were filtered), emit a trailing "(other)"
+            row so the children visibly account for the parent total.
+            """
+            nonlocal row
+            if mtype not in top_type_set:
+                return
+            info, phase_used = _lookup_variants(mtype, phase)
+            if not info:
+                return
+            variants = info["variants"]
+            total_time = info["total_time"]
+            total_count = info["total_count"]
+            child_indent = parent_indent + "    "
+            labeled_time = sum(vt for (_l, _s, vt, _c) in variants)
+            labeled_count = sum(vc for (_l, _s, _t, vc) in variants)
+            residual_time = max(0.0, total_time - labeled_time)
+            residual_count = max(0, total_count - labeled_count)
+            show_other = (residual_count > 0
+                          and total_time > 0
+                          and residual_time >= total_time * 0.01)
+            total_rows = len(variants) + (1 if show_other else 0)
+            for i, (label, _sig, vtime, vcount) in enumerate(variants):
+                is_last = (i == total_rows - 1)
+                connector = "└── " if is_last else "├── "
+                vpct = vtime / grand_total * 100 if grand_total > 0 else 0
+                detail_ref = self._format_detail_sheet_name(
+                    mtype, phase_used, label)
+                ws.cell(row=row, column=1,
+                        value=f"{child_indent}{connector}({label}) {vcount}x")
+                ws.cell(row=row, column=2, value=round(vtime, 1))
+                ws.cell(row=row, column=3, value=f"{vpct:.1f}%")
+                ws.cell(row=row, column=4, value=detail_ref)
+                for c in range(1, 5):
+                    ws.cell(row=row, column=c).font = Font(
+                        italic=True, color="555555")
+                row += 1
+            if show_other:
+                ws.cell(row=row, column=1,
+                        value=f"{child_indent}└── (other) {residual_count}x")
+                ws.cell(row=row, column=2, value=round(residual_time, 1))
+                ws.cell(row=row, column=3,
+                        value=f"{residual_time / grand_total * 100:.1f}%"
+                              if grand_total > 0 else "")
+                for c in range(1, 5):
+                    ws.cell(row=row, column=c).font = Font(
+                        italic=True, color="888888")
+                row += 1
 
         row = 1
 
@@ -1959,8 +2075,25 @@ class ReportGenerator:
             ws.cell(row=row, column=1, value=rtype)
             ws.cell(row=row, column=2, value=round(rtype_total, 1))
             ws.cell(row=row, column=3, value=f"{pct:.1f}%")
+            # Reference detail tab when the root itself has a detail sheet AND
+            # has no further wrapper-chain children to expand.
+            if rtype in top_type_set and len(chain) == 1:
+                root_info, root_phase_used = _lookup_variants(rtype, root_phase)
+                if root_info:
+                    first_label = root_info["variants"][0][0]
+                    ws.cell(row=row, column=4,
+                            value=self._format_detail_sheet_name(
+                                rtype, root_phase_used, first_label))
+                else:
+                    ws.cell(row=row, column=4,
+                            value=self._format_detail_sheet_name(
+                                rtype, root_phase, ""))
             row += 1
-            if len(chain) > 1:
+            # Expand variants for root types with no chain (e.g. extend
+            # DeepseekV4DecoderLayer → variants A/B).
+            if len(chain) == 1:
+                _write_variant_rows("", rtype, root_phase)
+            else:
                 scoped_totals: Dict[str, float] = defaultdict(float)
                 self._collect_by_type_total(rlist, scoped_totals, mode)
                 children = chain[1:]
@@ -1973,15 +2106,23 @@ class ReportGenerator:
                     ws.cell(row=row, column=2, value=round(ct, 1))
                     ws.cell(row=row, column=3, value=f"{ct_pct:.1f}%")
                     if ctype in top_type_set:
-                        if root_phase:
-                            suffix = f" ({root_phase[:3]})"
-                            detail_ref = f"{ctype[:28 - len(suffix)]}{suffix}"
+                        # If the chain leaf has variants, point at the first
+                        # variant tab; per-variant rows are emitted below.
+                        child_info, child_phase_used = _lookup_variants(
+                            ctype, root_phase)
+                        if child_info:
+                            first_label = child_info["variants"][0][0]
+                            detail_ref = self._format_detail_sheet_name(
+                                ctype, child_phase_used, first_label)
                         else:
-                            detail_ref = ctype[:28]
+                            detail_ref = self._format_detail_sheet_name(
+                                ctype, root_phase, "")
                         ws.cell(row=row, column=4, value=detail_ref)
                         for c in range(1, 5):
                             ws.cell(row=row, column=c).font = Font(bold=True)
                     row += 1
+                    # Indent variant rows under this chain child.
+                    _write_variant_rows("    ", ctype, root_phase)
 
         row += 1  # blank row
 
@@ -2385,8 +2526,17 @@ class ReportGenerator:
         Depth=2 captures grandchildren, so e.g. DeepseekV4DecoderLayer
         instances whose MQALayer children differ (C4Indexer vs Compressor)
         produce different signatures.
+
+        For leaf modules (no children_stats) we fall back to the kernel
+        category set so that synthetic CUDA-graph decode layers — which are
+        named "Layer_X" and carry kernels directly — can be split into
+        structural variants (e.g. MoE-only vs Dense+Embed vs MoE+Embed).
         """
-        if depth <= 0 or not stats.children_stats:
+        if depth <= 0:
+            return frozenset()
+        if not stats.children_stats:
+            if stats.kernel_breakdown:
+                return frozenset(("__kc__", cat) for cat in stats.kernel_breakdown)
             return frozenset()
         from collections import Counter
         child_sigs = Counter()
@@ -2479,6 +2629,86 @@ class ReportGenerator:
             if s.kernel_count > 0:
                 out[s.module_type].append(s)
             self._collect_instances_by_type(s.children_stats, out)
+
+    def _compute_variant_aggregates(self, stats_list: List[ModuleStats],
+                                    mode: str):
+        """Detect A/B/C structural variants per (module_type, phase) group.
+
+        A group has multiple variants when its instances produce more than one
+        distinct `_children_signature` (which falls back to the kernel-category
+        set for leaf modules — e.g. the synthetic decode "Layer_X" nodes).
+
+        A signature is considered "significant" when it covers >= 10% of the
+        group's instance count OR >= 10% of the group's total time.  The
+        time-based check is important for traces where a few instances (e.g.
+        warmup / CUDA-graph capture iterations) dominate runtime even though
+        they are count-rare; without it, A+B would only account for a small
+        slice of the parent total in the Summary tab.
+
+        Returns:
+          labels:     dict (mtype, phase, sig) -> 'A' | 'B' | ...
+          aggregates: dict (mtype, phase) -> [(label, sig, total_time, count), ...]
+                      ordered A, B, C ... (most frequent variant first).
+                      Only populated for (mtype, phase) with >= 2 significant
+                      variants.
+        """
+        def _time_of(s):
+            return s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+
+        all_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
+        self._collect_instances_by_type(stats_list, all_by_type)
+        labels: Dict[Tuple[str, str, frozenset], str] = {}
+        aggregates: Dict[Tuple[str, str], Dict] = {}
+        for mtype, instances in all_by_type.items():
+            by_phase: Dict[str, List[ModuleStats]] = defaultdict(list)
+            for s in instances:
+                by_phase[getattr(s, "phase", "")].append(s)
+            for phase, phase_instances in by_phase.items():
+                sig_groups: Dict[frozenset, List[ModuleStats]] = defaultdict(list)
+                for s in phase_instances:
+                    sig_groups[ReportGenerator._children_signature(s)].append(s)
+                if len(sig_groups) <= 1:
+                    continue
+                total_count = len(phase_instances)
+                total_time = sum(_time_of(s) for s in phase_instances)
+                min_count = max(1, total_count // 10)
+                min_time = total_time * 0.1
+                significant = []
+                for sg, group in sig_groups.items():
+                    gtime = sum(_time_of(s) for s in group)
+                    if len(group) >= min_count or gtime >= min_time:
+                        significant.append((sg, group, gtime))
+                if len(significant) <= 1:
+                    continue
+                significant.sort(key=lambda x: -len(x[1]))
+                variants = []
+                for i, (sg, group, gtime) in enumerate(significant):
+                    label = chr(ord('A') + i)
+                    labels[(mtype, phase, sg)] = label
+                    variants.append((label, sg, gtime, len(group)))
+                aggregates[(mtype, phase)] = {
+                    "variants": variants,
+                    "total_count": total_count,
+                    "total_time": total_time,
+                }
+        return labels, aggregates
+
+    @staticmethod
+    def _format_detail_sheet_name(mtype: str, phase: str, vlabel: str) -> str:
+        """Build the per-(type, phase, variant) detail-sheet name.
+
+        Excel limits sheet names to 31 chars; we truncate `mtype` to leave
+        room for the " (pre)" / " (dec,A)" suffix.
+        """
+        suffixes = []
+        if phase:
+            suffixes.append(phase[:3])
+        if vlabel:
+            suffixes.append(vlabel)
+        if suffixes:
+            suffix = f" ({','.join(suffixes)})"
+            return f"{mtype[:28 - len(suffix)]}{suffix}"
+        return mtype[:28]
 
     def _write_kernel_name_breakdown(self, ws, stats_list: List[ModuleStats],
                                      mode: str, row: int,
