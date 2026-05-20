@@ -1595,6 +1595,7 @@ class ReportGenerator:
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
                      output_path: str, max_detail_modules: int = 3,
                      detail_modules: Optional[List[str]] = None,
+                     detail_instances: Optional[List[int]] = None,
 ):
         """Export analysis to Excel workbook."""
         try:
@@ -1784,15 +1785,55 @@ class ReportGenerator:
                     _rare_keys.append((mtype, phase, sg))
         for key in _rare_keys:
             seen_types.pop(key, None)
+        # When --detail-instance is specified, collect those specific instances
+        # and skip the normal variant-based sheets for their types.
+        instance_override_types: set = set()
+        instance_detail_list: List[Tuple[ModuleStats, str]] = []
+        if detail_instances:
+            all_by_type_for_inst: Dict[str, List[ModuleStats]] = defaultdict(list)
+            self._collect_instances_by_type(stats_list, all_by_type_for_inst)
+            requested = set(detail_instances)
+            for mtype in top_type_names:
+                matches = [s for s in all_by_type_for_inst.get(mtype, [])
+                           if s.instance_id in requested]
+                if matches:
+                    instance_override_types.add(mtype)
+                    best_per_id: Dict[int, ModuleStats] = {}
+                    for s in matches:
+                        prev = best_per_id.get(s.instance_id)
+                        if prev is None or s.kernel_count > prev.kernel_count:
+                            best_per_id[s.instance_id] = s
+                    for iid in sorted(best_per_id):
+                        s = best_per_id[iid]
+                        phase = getattr(s, "phase", "")
+                        phase_suffix = f" ({phase[:3]})" if phase else ""
+                        sname = f"{s.name}{phase_suffix}"[:31]
+                        instance_detail_list.append((s, sname))
+            not_found = requested - {s.instance_id for s, _ in instance_detail_list}
+            if not_found:
+                print(f"  WARNING: instance IDs not found: {sorted(not_found)}")
+
         # Sort detail tabs by total kernel time descending (highest % first)
         sorted_detail_items = sorted(
             seen_types.items(),
             key=lambda item: -type_total_time.get(item[0][0], 0))
+        # Append user-specified instance sheets
+        for inst_stats, sname in instance_detail_list:
+            sorted_detail_items.append(
+                ((inst_stats.module_type, getattr(inst_stats, "phase", ""),
+                  frozenset()), inst_stats))
         for (mtype, phase, sig), rep_stats in sorted_detail_items:
             if mtype not in top_type_names:
                 continue
-            vlabel = variant_labels.get((mtype, phase, sig), "")
-            sheet_name = self._format_detail_sheet_name(mtype, phase, vlabel)
+            # Skip variant-based sheets for types with user-specified instances
+            if mtype in instance_override_types and sig != frozenset():
+                continue
+            if mtype in instance_override_types:
+                sheet_name = [sn for s, sn in instance_detail_list
+                              if s is rep_stats][0]
+            else:
+                vlabel = variant_labels.get((mtype, phase, sig), "")
+                sheet_name = self._format_detail_sheet_name(mtype, phase, vlabel)
             ws_det = wb.create_sheet(title=sheet_name)
             all_details = self._collect_all_details(rep_stats)
             all_details.sort(key=lambda d: d.ts)
@@ -2766,6 +2807,7 @@ class TraceModuleAnalyzer:
                  output_path: Optional[str] = None,
                  detail_modules: Optional[List[str]] = None,
                  module_index: Optional[int] = None,
+                 detail_instances: Optional[List[int]] = None,
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
@@ -2774,6 +2816,7 @@ class TraceModuleAnalyzer:
         self.output_path = output_path
         self.detail_modules = detail_modules or []
         self.module_index = module_index
+        self.detail_instances = detail_instances
         self.max_detail_modules = max_detail_modules
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
@@ -2969,7 +3012,8 @@ class TraceModuleAnalyzer:
         if xlsx_path:
             reporter.export_excel(stats_list, mode, xlsx_path,
                                   max_detail_modules=self.max_detail_modules,
-                                  detail_modules=self.detail_modules)
+                                  detail_modules=self.detail_modules,
+                                  detail_instances=self.detail_instances)
             print(f"  {_elapsed()} excel export done")
 
         if self.model_info and xlsx_path:
@@ -3044,6 +3088,198 @@ class TraceModuleAnalyzer:
 
 
 # ---------------------------------------------------------------------------
+# Recategorize existing Excel
+# ---------------------------------------------------------------------------
+
+def recategorize_excel(xlsx_path: str, output_path: Optional[str] = None):
+    """Re-apply kernel_categories.csv to an existing analysis Excel file.
+
+    Updates Category columns and summary tables in-place (or to a new file).
+    No trace file is needed.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        print("ERROR: openpyxl not installed. Run: pip install openpyxl",
+              file=sys.stderr)
+        sys.exit(1)
+
+    categories = _load_kernel_categories()
+    if not categories:
+        print("ERROR: kernel_categories.csv not found or empty", file=sys.stderr)
+        sys.exit(1)
+
+    def classify(name: str) -> str:
+        for cat, pat in categories:
+            if pat.search(name):
+                return cat
+        return "other"
+
+    wb = openpyxl.load_workbook(xlsx_path)
+    skip_sheets = {"Summary", "Overview", "Module Tree", "GPU Kernels"}
+    changes = 0
+
+    # --- Detail sheets: update kernel Category (col 6) + category summary ---
+    for sname in wb.sheetnames:
+        if sname in skip_sheets:
+            continue
+        ws = wb[sname]
+        # Find kernel detail header row (has "Kernel Name" in some column)
+        header_row = None
+        name_col = cat_col = dur_col = None
+        for r in range(1, min(ws.max_row + 1, 40)):
+            for c in range(1, ws.max_column + 1):
+                if ws.cell(r, c).value == "Kernel Name":
+                    header_row = r
+                    name_col = c
+                    break
+            if header_row:
+                break
+        if not header_row or not name_col:
+            continue
+        # Find Category and Duration columns
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(header_row, c).value
+            if val == "Category":
+                cat_col = c
+            elif val == "Duration (us)":
+                dur_col = c
+        if not cat_col:
+            continue
+
+        # Update each kernel row
+        cat_dur: Dict[str, float] = defaultdict(float)
+        for r in range(header_row + 1, ws.max_row + 1):
+            kname = ws.cell(r, name_col).value
+            if not kname or "truncated" in str(kname):
+                break
+            old_cat = ws.cell(r, cat_col).value or ""
+            new_cat = classify(str(kname))
+            if old_cat != new_cat:
+                ws.cell(r, cat_col).value = new_cat
+                changes += 1
+            dur = ws.cell(r, dur_col).value if dur_col else 0
+            cat_dur[new_cat] += float(dur or 0)
+
+        # Find and rewrite the category summary table (rows 7+)
+        cat_header_row = None
+        for r in range(1, header_row):
+            if ws.cell(r, 1).value == "Category":
+                cat_header_row = r
+                break
+        if cat_header_row:
+            sorted_cats = sorted(cat_dur.items(), key=lambda x: -x[1])
+            cat_total = sum(cat_dur.values())
+            # Clear old summary rows (between header and kernel detail header)
+            cr = cat_header_row + 1
+            while cr < header_row - 1:
+                for c in range(1, 4):
+                    ws.cell(cr, c).value = None
+                    ws.cell(cr, c).font = Font()
+                cr += 1
+            # Write new summary
+            cr = cat_header_row + 1
+            for cat, dur in sorted_cats:
+                pct = dur / cat_total * 100 if cat_total > 0 else 0
+                ws.cell(cr, 1).value = cat
+                ws.cell(cr, 2).value = f"{pct:.0f}%"
+                ws.cell(cr, 3).value = round(dur, 1)
+                cr += 1
+            ws.cell(cr, 1).value = "Total"
+            ws.cell(cr, 1).font = Font(bold=True)
+            ws.cell(cr, 2).value = "100%"
+            ws.cell(cr, 2).font = Font(bold=True)
+            ws.cell(cr, 3).value = round(cat_total, 1)
+            ws.cell(cr, 3).font = Font(bold=True)
+
+        print(f"  {sname}: {len(cat_dur)} categories, "
+              f"{sum(1 for _ in range(header_row+1, ws.max_row+1) if ws.cell(_, name_col).value and 'truncated' not in str(ws.cell(_, name_col).value or ''))} kernels")
+
+    # --- GPU Kernels sheet: update Category (col 2) ---
+    if "GPU Kernels" in wb.sheetnames:
+        ws_gk = wb["GPU Kernels"]
+        gk_changes = 0
+        for r in range(2, ws_gk.max_row + 1):
+            kname = ws_gk.cell(r, 1).value
+            if not kname:
+                break
+            old_cat = ws_gk.cell(r, 2).value or ""
+            new_cat = classify(str(kname))
+            if old_cat != new_cat:
+                ws_gk.cell(r, 2).value = new_cat
+                gk_changes += 1
+        if gk_changes:
+            print(f"  GPU Kernels: {gk_changes} categories updated")
+
+    # --- Summary sheet: update category breakdown table ---
+    if "Summary" in wb.sheetnames:
+        ws_sum = wb["Summary"]
+        # Find "Category" header row
+        cat_row = None
+        for r in range(1, ws_sum.max_row + 1):
+            if ws_sum.cell(r, 1).value == "Category":
+                cat_row = r
+                break
+        if cat_row:
+            # Re-aggregate from GPU Kernels sheet (most accurate global source)
+            global_cat: Dict[str, Tuple[int, float]] = defaultdict(
+                lambda: (0, 0.0))
+            if "GPU Kernels" in wb.sheetnames:
+                ws_gk = wb["GPU Kernels"]
+                for r in range(2, ws_gk.max_row + 1):
+                    kname = ws_gk.cell(r, 1).value
+                    if not kname:
+                        break
+                    cat = ws_gk.cell(r, 2).value or "other"
+                    count = ws_gk.cell(r, 4).value or 0
+                    dur = ws_gk.cell(r, 3).value or 0
+                    prev = global_cat[cat]
+                    global_cat[cat] = (prev[0] + int(count),
+                                       prev[1] + float(dur))
+            sorted_global = sorted(global_cat.items(), key=lambda x: -x[1][1])
+            # Clear old rows after category header
+            cr = cat_row + 1
+            while cr <= ws_sum.max_row:
+                v = ws_sum.cell(cr, 1).value
+                if v is None or v == "":
+                    break
+                for c in range(1, 5):
+                    ws_sum.cell(cr, c).value = None
+                cr += 1
+            # Write new category rows
+            cr = cat_row + 1
+            for cat, (count, dur) in sorted_global:
+                ws_sum.cell(cr, 1).value = cat
+                ws_sum.cell(cr, 2).value = count
+                ws_sum.cell(cr, 3).value = round(dur, 1)
+                cr += 1
+            print(f"  Summary: {len(sorted_global)} categories updated")
+
+    # --- Module Tree sheet: update Breakdown strings (col 4) ---
+    if "Module Tree" in wb.sheetnames:
+        ws_tree = wb["Module Tree"]
+        tree_changes = 0
+        for r in range(2, ws_tree.max_row + 1):
+            bd = ws_tree.cell(r, 4).value
+            if not bd or not isinstance(bd, str):
+                continue
+            # Breakdown format: "cat: dur us (pct%), cat: dur us (pct%), ..."
+            # We can't fully recompute this without the original kernel data,
+            # so skip Module Tree recategorization (it requires re-running
+            # the full trace analysis).
+            pass
+
+    save_path = output_path or xlsx_path
+    wb.save(save_path)
+    print(f"\nRecategorized Excel saved to: {save_path}")
+    if changes:
+        print(f"  {changes} kernel category assignments changed in detail sheets")
+    else:
+        print("  No category changes detected (Excel already up-to-date)")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -3068,11 +3304,19 @@ Examples:
   # Generate interactive module tree HTML and serve it (auto-generates xlsx if no -o)
   python trace_module_analyzer.py trace.json.gz --model-info
   python trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info --port 9000
+
+  # Re-apply kernel_categories.csv to existing Excel(s) (no trace needed)
+  python trace_module_analyzer.py --recategorize report.xlsx
+  python trace_module_analyzer.py --recategorize b200.xlsx mi355.xlsx
 """,
     )
-    parser.add_argument("trace_file", help="Path to trace file (.json.gz or .json)")
+    parser.add_argument("trace_file", nargs="?", default=None,
+                        help="Path to trace file (.json.gz or .json)")
     parser.add_argument("-o", "--output", dest="output", default=None,
                         help="Output Excel report path (.xlsx)")
+    parser.add_argument("--recategorize", nargs="+", metavar="XLSX",
+                        help="Re-apply kernel_categories.csv to one or more existing "
+                             "Excel files (no trace file needed)")
     parser.add_argument("--max-detail-modules", type=int, default=3,
                         help="Number of module types to generate detail sheets for "
                              "(default: 3, 0=all)")
@@ -3082,6 +3326,9 @@ Examples:
     parser.add_argument("--module-index", type=int, default=None,
                         help="Which occurrence of the module to show detail for "
                              "(default: the instance closest to the median)")
+    parser.add_argument("--detail-instance", nargs="+", type=int, default=None,
+                        help="Instance IDs for Excel detail sheets "
+                             "(e.g. --detail-instance 59 60 61 62)")
     parser.add_argument("--model-info", action="store_true",
                         help="Generate interactive module tree HTML visualization "
                              "and start HTTP server (requires visualize_module_tree.py)")
@@ -3099,6 +3346,16 @@ Examples:
         format="%(levelname)s: %(message)s",
     )
 
+    # --recategorize: update categories in existing Excel, no trace needed
+    if args.recategorize:
+        for xlsx in args.recategorize:
+            print(f"Recategorizing: {xlsx}")
+            recategorize_excel(xlsx)
+        return
+
+    if not args.trace_file:
+        parser.error("trace_file is required (unless using --recategorize)")
+
     # Resolve output path: if relative, save to same folder as trace file
     output_path = args.output
     if output_path and not os.path.isabs(output_path):
@@ -3111,6 +3368,7 @@ Examples:
             output_path=output_path,
             detail_modules=args.detail_module,
             module_index=args.module_index,
+            detail_instances=args.detail_instance,
             max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,
