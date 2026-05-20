@@ -2528,15 +2528,19 @@ class ReportGenerator:
         produce different signatures.
 
         For leaf modules (no children_stats) we fall back to the kernel
-        category set so that synthetic CUDA-graph decode layers — which are
-        named "Layer_X" and carry kernels directly — can be split into
-        structural variants (e.g. MoE-only vs Dense+Embed vs MoE+Embed).
+        category breakdown (category + count) so that synthetic CUDA-graph
+        decode layers — which are named "Layer_X" and carry kernels
+        directly — can be split into structural variants even when two
+        variants share the same set of categories but differ in kernel
+        counts (e.g. 27-kernel vs 43-kernel layers in DeepSeek-V4).
         """
         if depth <= 0:
             return frozenset()
         if not stats.children_stats:
             if stats.kernel_breakdown:
-                return frozenset(("__kc__", cat) for cat in stats.kernel_breakdown)
+                return frozenset(
+                    ("__kc__", cat, count)
+                    for cat, (_dur, count) in stats.kernel_breakdown.items())
             return frozenset()
         from collections import Counter
         child_sigs = Counter()
