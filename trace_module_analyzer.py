@@ -1801,8 +1801,13 @@ class ReportGenerator:
                     best_per_id: Dict[int, ModuleStats] = {}
                     for s in matches:
                         prev = best_per_id.get(s.instance_id)
-                        if prev is None or s.kernel_count > prev.kernel_count:
+                        if prev is None:
                             best_per_id[s.instance_id] = s
+                        else:
+                            s_time = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+                            prev_time = prev.total_kernel_time if mode == "full" else prev.total_cpu_op_time
+                            if s_time > prev_time:
+                                best_per_id[s.instance_id] = s
                     for iid in sorted(best_per_id):
                         s = best_per_id[iid]
                         phase = getattr(s, "phase", "")
@@ -2620,12 +2625,17 @@ class ReportGenerator:
     @staticmethod
     def _dedup_by_instance_id(instances: List[ModuleStats],
                               mode: str) -> List[ModuleStats]:
-        """Keep one instance per unique instance_id (the one with most kernels)."""
+        """Keep one instance per unique instance_id (the one with most kernel time)."""
         best: Dict[int, ModuleStats] = {}
         for s in instances:
             prev = best.get(s.instance_id)
-            if prev is None or s.kernel_count > prev.kernel_count:
+            if prev is None:
                 best[s.instance_id] = s
+            else:
+                s_time = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+                prev_time = prev.total_kernel_time if mode == "full" else prev.total_cpu_op_time
+                if s_time > prev_time:
+                    best[s.instance_id] = s
         return sorted(best.values(), key=lambda s: s.instance_id)
 
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
