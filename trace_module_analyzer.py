@@ -523,7 +523,7 @@ class CudaGraphCorrelator:
     """Correlate CUDA-graph-replayed kernels to synthetic layer modules."""
 
     _COMM_RE = re.compile(
-        r"all_reduce|allreduce|cross_device_reduce|nccl|rccl|broadcast|allgather"
+        r"all_reduce|allreduce|cross_device_reduce|nccl|rccl|allgather"
         r"|reduce_scatter|quickreduce|all_to_all", re.IGNORECASE)
     _ATTN_RE = re.compile(
         r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax"
@@ -2818,6 +2818,7 @@ class TraceModuleAnalyzer:
                  detail_modules: Optional[List[str]] = None,
                  module_index: Optional[int] = None,
                  detail_instances: Optional[List[int]] = None,
+                 phase_index=None,
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
@@ -2827,6 +2828,7 @@ class TraceModuleAnalyzer:
         self.detail_modules = detail_modules or []
         self.module_index = module_index
         self.detail_instances = detail_instances
+        self.phase_index = phase_index
         self.max_detail_modules = max_detail_modules
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
@@ -2865,6 +2867,8 @@ class TraceModuleAnalyzer:
         gpu_memset = []
         phase_markers = []  # (ts, phase, tid, pid) for prefill/decode detection
 
+        gpu_user_annotations = []  # ATOM-style GPU-side phase markers
+
         MODULE_PREFIX = "nn.Module: "
         for e in events:
             cat = e.get("cat", "")
@@ -2880,6 +2884,9 @@ class TraceModuleAnalyzer:
                 gpu_memcpy.append(e)
             elif cat == "gpu_memset":
                 gpu_memset.append(e)
+            elif cat == "gpu_user_annotation":
+                if e.get("dur") is not None:
+                    gpu_user_annotations.append(e)
             elif cat == "python_function":
                 name = e.get("name", "")
                 if name.startswith(MODULE_PREFIX) and e.get("dur") is not None:
@@ -2909,12 +2916,55 @@ class TraceModuleAnalyzer:
         print(f"  python_function events: {len(pyfunc_events):,}")
         print(f"  gpu_memcpy events: {len(gpu_memcpy):,}")
         print(f"  gpu_memset events: {len(gpu_memset):,}")
+        print(f"  gpu_user_annotation events: {len(gpu_user_annotations):,}")
         print(f"  phase markers: {len(phase_markers):,}")
         print(f"  Mode: {mode}")
 
         # Step 2: Build module hierarchy tree
         print(f"  {_elapsed()} event categorization done")
         if not module_events:
+            # Try ATOM-style traces: gpu_user_annotation with prefill/decode spans
+            atom_phases = [e for e in gpu_user_annotations
+                           if e.get("name", "").startswith(("prefill[", "decode["))]
+            if atom_phases and kernel_events:
+                print("\nNo nn.Module events found. Detected ATOM-style trace with "
+                      f"{len(atom_phases)} gpu_user_annotation phase spans.")
+                print("Building synthetic module hierarchy from GPU phase annotations...")
+                roots = self._build_atom_module_tree(
+                    atom_phases, kernel_events + gpu_memcpy + gpu_memset)
+                del gpu_user_annotations
+                if roots:
+                    # Skip normal correlation — kernels already assigned to nodes
+                    print(f"  {_elapsed()} ATOM module hierarchy built")
+                    phase_detector = PhaseDetector()
+                    phase_detector.detect_from_markers(roots, phase_markers)
+                    self._propagate_phase(roots)
+
+                    print(f"  {_elapsed()} phase detection done")
+                    print("\nAggregating module statistics...")
+                    aggregator = ModuleAggregator()
+                    stats_list = aggregator.aggregate(roots, mode)
+                    self._copy_phase_to_stats(roots, stats_list)
+                    stats_list = self._filter_by_phase_index(stats_list)
+
+                    print(f"  {_elapsed()} aggregation done")
+                    reporter = ReportGenerator()
+                    reporter.print_type_summary(stats_list, mode,
+                                                max_detail_modules=self.max_detail_modules,
+                                                detail_modules=self.detail_modules)
+                    for dm in self.detail_modules:
+                        reporter.print_layer_detail(stats_list, mode, dm,
+                                                    self.module_index)
+                    print(f"  {_elapsed()} console output done")
+
+                    xlsx_path = self.output_path
+                    if xlsx_path:
+                        reporter.export_excel(stats_list, mode, xlsx_path,
+                                              max_detail_modules=self.max_detail_modules,
+                                              detail_modules=self.detail_modules,
+                                              detail_instances=self.detail_instances)
+                        print(f"  {_elapsed()} excel export done")
+                    return
             print("\nWARNING: No nn.Module events found. Trace may not have been captured "
                   "with `with_modules=True`.")
             print("Falling back to basic kernel-only analysis.")
@@ -2993,6 +3043,7 @@ class TraceModuleAnalyzer:
         stats_list = aggregator.aggregate(roots, mode)
         # Propagate phase from nodes
         self._copy_phase_to_stats(roots, stats_list)
+        stats_list = self._filter_by_phase_index(stats_list)
 
         print(f"  {_elapsed()} aggregation done")
         # Step 6: Output
@@ -3061,6 +3112,124 @@ class TraceModuleAnalyzer:
             stats.phase = getattr(node, "_phase", "")
             self._copy_phase_to_stats(node.children, stats.children_stats)
 
+    def _filter_by_phase_index(self, stats_list: List[ModuleStats]) -> List[ModuleStats]:
+        if self.phase_index is None:
+            return stats_list
+        val = self.phase_index
+        if isinstance(val, int):
+            filtered = [s for s in stats_list if s.instance_id == val]
+        else:
+            filtered = [s for s in stats_list if s.name == val]
+        kept = [s.name for s in filtered]
+        dropped = len(stats_list) - len(filtered)
+        if kept:
+            print(f"  --phase-index {val}: kept {', '.join(kept)} "
+                  f"(dropped {dropped} other roots)")
+        else:
+            print(f"  WARNING: --phase-index {val} matched no roots. "
+                  f"Available: {', '.join(s.name for s in stats_list)}")
+        return filtered
+
+    def _build_atom_module_tree(self, gpu_phase_events: List[Dict],
+                                all_gpu_events: List[Dict]) -> List[ModuleNode]:
+        """Build synthetic module hierarchy from ATOM gpu_user_annotation spans.
+
+        ATOM traces lack nn.Module events but have gpu_user_annotation spans
+        like "prefill[bs=1 tok=7112 ctx=7112]" and "decode[bs=4 tok=4 d=4]"
+        that contain GPU kernels by timestamp.  Within each span, COMM-based
+        segmentation splits kernels into layer-like groups.
+
+        Multi-stream dedup: the same iteration may have spans on multiple GPU
+        streams.  We pick the stream with the most spans (the "main" compute
+        stream) and ignore duplicates on other streams.
+        """
+        # Pick the stream with the most phase spans as the primary stream
+        stream_counts: Dict[int, int] = defaultdict(int)
+        for e in gpu_phase_events:
+            stream_counts[e.get("tid", 0)] += 1
+        primary_tid = max(stream_counts, key=stream_counts.get)  # type: ignore[arg-type]
+        phase_events = sorted(
+            [e for e in gpu_phase_events if e.get("tid", 0) == primary_tid],
+            key=lambda e: e.get("ts", 0))
+        print(f"  Primary GPU stream tid={primary_tid} "
+              f"({len(phase_events)} of {len(gpu_phase_events)} spans)")
+
+        gpu_events_sorted = sorted(all_gpu_events, key=lambda e: e.get("ts", 0))
+        gpu_ts = [e.get("ts", 0) for e in gpu_events_sorted]
+
+        graph_correlator = CudaGraphCorrelator.__new__(CudaGraphCorrelator)
+        graph_correlator._graph_corrs = set()
+
+        roots = []
+        prefill_idx = 0
+        decode_idx = 0
+        total_matched = 0
+
+        for pe in phase_events:
+            name = pe.get("name", "")
+            ts = pe["ts"]
+            dur = pe["dur"]
+            end = ts + dur
+            tid = pe.get("tid", 0)
+            pid = pe.get("pid", 0)
+
+            is_prefill = name.startswith("prefill[")
+            phase = "prefill" if is_prefill else "decode"
+
+            if is_prefill:
+                root_type = "Prefill"
+                root_id = prefill_idx
+                prefill_idx += 1
+            else:
+                root_type = "Decode"
+                root_id = decode_idx
+                decode_idx += 1
+
+            lo = bisect.bisect_left(gpu_ts, ts)
+            hi = bisect.bisect_right(gpu_ts, end)
+            span_kernels = [gpu_events_sorted[i] for i in range(lo, hi)
+                            if gpu_events_sorted[i].get("ts", 0) + gpu_events_sorted[i].get("dur", 0) <= end]
+
+            if not span_kernels:
+                continue
+
+            root_name = f"{root_type}_{root_id}"
+            root = ModuleNode(
+                name=root_name,
+                module_type=root_type,
+                instance_id=root_id,
+                ts=ts, end=end,
+                tid=tid, pid=pid,
+            )
+            root._phase = phase
+
+            kernel_names = [k.get("name", "") for k in span_kernels]
+            layer_bounds = graph_correlator._detect_layers(kernel_names)
+
+            for layer_i, (start, end_idx, label) in enumerate(layer_bounds):
+                layer_name = f"Layer_{layer_i}"
+                layer_kernels = span_kernels[start:end_idx]
+                if not layer_kernels:
+                    continue
+                layer_node = ModuleNode(
+                    name=layer_name,
+                    module_type="Layer",
+                    instance_id=layer_i,
+                    ts=layer_kernels[0].get("ts", 0),
+                    end=layer_kernels[-1].get("ts", 0) + layer_kernels[-1].get("dur", 0),
+                    tid=tid, pid=pid,
+                )
+                layer_node._phase = phase
+                layer_node.kernels = layer_kernels
+                total_matched += len(layer_kernels)
+                root.children.append(layer_node)
+
+            roots.append(root)
+
+        print(f"  Built {len(roots)} iteration roots "
+              f"({prefill_idx} prefill, {decode_idx} decode)")
+        print(f"  Matched {total_matched:,} / {len(all_gpu_events):,} GPU events")
+        return roots
 
     def _fallback_kernel_only(self, kernel_events: List[Dict]):
         """Basic kernel-only analysis when no module events are present."""
@@ -3315,6 +3484,11 @@ Examples:
   python trace_module_analyzer.py trace.json.gz --model-info
   python trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info --port 9000
 
+  # Restrict to a specific forward pass (ATOM traces with multiple passes)
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --phase-index Prefill_0
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --phase-index Prefill_0 --detail-instance 16 17 18 19
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --phase-index 0  # keeps Prefill_0 + Decode_0
+
   # Re-apply kernel_categories.csv to existing Excel(s) (no trace needed)
   python trace_module_analyzer.py --recategorize report.xlsx
   python trace_module_analyzer.py --recategorize b200.xlsx mi355.xlsx
@@ -3344,6 +3518,11 @@ Examples:
                              "and start HTTP server (requires visualize_module_tree.py)")
     parser.add_argument("--port", type=int, default=8765,
                         help="HTTP server port for --model-info (default: 8765)")
+    parser.add_argument("--phase-index", default=None,
+                        help="Restrict analysis to a specific forward pass. "
+                             "Use a name like Prefill_0 or Decode_2 for a single root, "
+                             "or an integer like 0 to keep all roots with that index "
+                             "(e.g. Prefill_0 + Decode_0)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -3372,6 +3551,13 @@ Examples:
         trace_dir = os.path.dirname(os.path.abspath(args.trace_file))
         output_path = os.path.join(trace_dir, output_path)
 
+    phase_index = args.phase_index
+    if phase_index is not None:
+        try:
+            phase_index = int(phase_index)
+        except ValueError:
+            pass
+
     try:
         analyzer = TraceModuleAnalyzer(
             trace_path=args.trace_file,
@@ -3379,6 +3565,7 @@ Examples:
             detail_modules=args.detail_module,
             module_index=args.module_index,
             detail_instances=args.detail_instance,
+            phase_index=phase_index,
             max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,

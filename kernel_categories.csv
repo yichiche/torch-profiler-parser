@@ -1,5 +1,5 @@
 category,pattern
-communication,"all_reduce|allreduce|cross_device_reduce|nccl|rccl|broadcast|allgather|reduce_scatter|quickreduce|all_to_all"
+communication,"all_reduce|allreduce|cross_device_reduce|nccl|rccl|allgather|reduce_scatter|quickreduce|all_to_all"
 mhc,"mhc|flash_c4_decode|flash_c128_decode|flash_c4_prefill|flash_c128_prefill|write_c4_prefill|c128_decode|_c4_decode|_c128_prefill_compress|_c4_prefill_compress|_c4_prefill_write|hadamard|_compress_norm_rope|_triton_fused_store_flashmla|_triton_fused_store_indexer|fp8_paged_mqa_logits"
 normalization,"layer_norm|rmsnorm|rms_norm|RMSNormKernel|batch_norm|group_norm|scale_shift|rsqrt|_mean_pow"
 attention,"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attn|attention|softmax(?![a-zA-Z])|fmha_|FmhaBatchPrefill|mla_reduce|kv_cache|flashinfer(?!.*Quantization)|set_mla_kv|paged_attention|radix|chunk_gated_delta_rule|chunk_fwd_kernel|causal_conv1d|fused_gdn|flash_fwd_splitkv_mla|mla_combine|combine_splitk|_unified_sparse_decode|_gather_dequant_dsv4|CatArrayBatchedCopy"
