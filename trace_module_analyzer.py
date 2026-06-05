@@ -2725,6 +2725,93 @@ class TraceModuleAnalyzer:
             pct = dur / total_dur * 100 if total_dur > 0 else 0
             print(f"  {cat:<20s} {dur:>14,.0f} {cnt:>8,d} {pct:>6.1f}%")
 
+        # Generate Excel if an output path was requested
+        xlsx_path = self.output_path
+        if not xlsx_path and self.model_info:
+            trace_dir = os.path.dirname(os.path.abspath(self.trace_path))
+            trace_base = os.path.splitext(os.path.basename(self.trace_path))[0]
+            if trace_base.endswith(".json"):
+                trace_base = trace_base[:-5]
+            xlsx_path = os.path.join(trace_dir, f"{trace_base}_analysis.xlsx")
+
+        if xlsx_path:
+            try:
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Kernel-Only Summary"
+                header_font = Font(bold=True)
+                header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF",
+                                          fill_type="solid")
+                headers = ["Category", "Duration (us)", "Count", "% of Total"]
+                for col, h in enumerate(headers, 1):
+                    cell = ws.cell(row=1, column=col, value=h)
+                    cell.font = header_font
+                    cell.fill = header_fill
+
+                row = 2
+                for cat, (dur, cnt) in sorted(breakdown.items(), key=lambda x: -x[1][0]):
+                    pct = dur / total_dur * 100 if total_dur > 0 else 0
+                    ws.cell(row=row, column=1, value=cat)
+                    ws.cell(row=row, column=2, value=round(dur, 1))
+                    ws.cell(row=row, column=3, value=cnt)
+                    ws.cell(row=row, column=4, value=round(pct, 2))
+                    row += 1
+
+                # Totals row
+                ws.cell(row=row, column=1, value="TOTAL").font = header_font
+                ws.cell(row=row, column=2, value=round(total_dur, 1)).font = header_font
+                ws.cell(row=row, column=3,
+                        value=len(kernel_events)).font = header_font
+                ws.cell(row=row, column=4, value=100.0).font = header_font
+
+                ws.column_dimensions["A"].width = 24
+
+                # GPU Kernels tab: per-kernel-name aggregation
+                ws_kn = wb.create_sheet(title="GPU Kernels")
+                kn_headers = ["Kernel Name", "Category", "Total Duration (us)",
+                              "Count", "Avg (us)", "% of Total"]
+                for col, h in enumerate(kn_headers, 1):
+                    cell = ws_kn.cell(row=1, column=col, value=h)
+                    cell.font = header_font
+                    cell.fill = header_fill
+
+                kn_agg: Dict[str, List] = {}  # name -> [dur, count, category]
+                for k in kernel_events:
+                    kname = k.get("name", "")
+                    dur = k.get("dur", 0)
+                    cat = _categorize_kernel(kname)
+                    entry = kn_agg.get(kname)
+                    if entry:
+                        entry[0] += dur
+                        entry[1] += 1
+                    else:
+                        kn_agg[kname] = [dur, 1, cat]
+
+                sorted_kn = sorted(kn_agg.items(), key=lambda x: -x[1][0])
+                truncated = len(sorted_kn) > MAX_ROWS_PER_TAB
+                kn_row = 2
+                for kname, (dur, cnt, cat) in sorted_kn[:MAX_ROWS_PER_TAB]:
+                    pct = dur / total_dur * 100 if total_dur > 0 else 0
+                    ws_kn.cell(row=kn_row, column=1, value=kname)
+                    ws_kn.cell(row=kn_row, column=2, value=cat)
+                    ws_kn.cell(row=kn_row, column=3, value=round(dur, 1))
+                    ws_kn.cell(row=kn_row, column=4, value=cnt)
+                    ws_kn.cell(row=kn_row, column=5,
+                               value=round(dur / cnt, 1) if cnt else 0)
+                    ws_kn.cell(row=kn_row, column=6, value=round(pct, 1))
+                    kn_row += 1
+                if truncated:
+                    ws_kn.cell(row=kn_row, column=1,
+                               value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+                ws_kn.column_dimensions["A"].width = 80
+
+                wb.save(xlsx_path)
+                print(f"\n  Kernel-only Excel report saved to: {xlsx_path}")
+            except ImportError:
+                print("  (openpyxl not installed — skipping Excel export)")
+
     @staticmethod
     def _load_trace(path: str) -> Dict[str, Any]:
         if path.endswith(".gz"):
