@@ -527,7 +527,7 @@ class CudaGraphCorrelator:
         r"|reduce_scatter|quickreduce|all_to_all", re.IGNORECASE)
     _ATTN_RE = re.compile(
         r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax"
-        r"|fmha_|mla_reduce|kv_cache|paged_attention|chunk_gated_delta_rule"
+        r"|fmha|mla_reduce|kv_cache|paged_attention|chunk_gated_delta_rule"
         r"|fused_gdn|kn_get_mla_metadata|kn_mla_reduce|gating_delta_rule",
         re.IGNORECASE)
     _MOE_RE = re.compile(
