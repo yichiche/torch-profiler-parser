@@ -523,11 +523,11 @@ class CudaGraphCorrelator:
     """Correlate CUDA-graph-replayed kernels to synthetic layer modules."""
 
     _COMM_RE = re.compile(
-        r"all_reduce|allreduce|cross_device_reduce|nccl|rccl|broadcast|allgather"
+        r"all_reduce|allreduce|cross_device_reduce|nccl|rccl|allgather"
         r"|reduce_scatter|quickreduce|all_to_all", re.IGNORECASE)
     _ATTN_RE = re.compile(
         r"aiter::mla_|mla_a8w8|decode_attention|flash_attn|attention|softmax"
-        r"|fmha_|mla_reduce|kv_cache|paged_attention|chunk_gated_delta_rule"
+        r"|fmha|mla_reduce|kv_cache|paged_attention|chunk_gated_delta_rule"
         r"|fused_gdn|kn_get_mla_metadata|kn_mla_reduce|gating_delta_rule",
         re.IGNORECASE)
     _MOE_RE = re.compile(
@@ -1355,19 +1355,19 @@ class ReportGenerator:
 
     def _pick_median_instance(self, matches: List[ModuleStats],
                               mode: str) -> Tuple[ModuleStats, str]:
-        """Pick the instance closest to the median total time."""
-        if len(matches) == 1:
-            return matches[0], f"only instance (id={matches[0].instance_id})"
+        """Pick the instance at the median position by total time.
 
-        timed = [(m.total_kernel_time if mode == "full" else m.total_cpu_op_time, m)
-                 for m in matches]
-        timed.sort(key=lambda x: x[0])
-        mid = len(timed) // 2
-        median_val = timed[mid][0]
-        # Find closest to median
-        best = min(timed, key=lambda x: abs(x[0] - median_val))
-        return best[1], (f"closest to median (id={best[1].instance_id}, "
-                         f"{best[0]:,.0f} us, median={median_val:,.0f} us)")
+        Deduplicates by instance_id first so median reflects unique layers,
+        not repeated forward passes.
+        """
+        deduped = self._dedup_by_instance_id(matches, mode)
+        if len(deduped) == 1:
+            return deduped[0], f"only instance (id={deduped[0].instance_id})"
+        mid = len(deduped) // 2
+        pick = deduped[mid]
+        t = pick.total_kernel_time if mode == "full" else pick.total_cpu_op_time
+        return pick, (f"median position (id={pick.instance_id}, "
+                      f"{t:,.0f} us, pos {mid+1}/{len(deduped)})")
 
     def _find_modules(self, stats_list: List[ModuleStats], module_type: str,
                       out: List[ModuleStats]):
@@ -1400,6 +1400,47 @@ class ReportGenerator:
         if not detail_modules:
             top_type_names, root_chains, type_totals, wrapper_types, type_children_map = \
                 self._select_max_detail_modules(stats_list, mode, max_detail_modules)
+        else:
+            top_type_names = set(detail_modules)
+
+        _, variant_aggregates = self._compute_variant_aggregates(stats_list, mode)
+
+        def _lookup_variants(mtype: str, phase: str):
+            info = variant_aggregates.get((mtype, phase))
+            if info is not None:
+                return info, phase
+            info = variant_aggregates.get((mtype, ""))
+            if info is not None:
+                return info, ""
+            return None, phase
+
+        def _print_variant_rows(parent_indent: str, mtype: str, phase: str):
+            if mtype not in top_type_names:
+                return
+            info, phase_used = _lookup_variants(mtype, phase)
+            if not info:
+                return
+            variants = info["variants"]
+            total_time = info["total_time"]
+            total_count = info["total_count"]
+            labeled_time = sum(vt for (_l, _s, vt, _c) in variants)
+            labeled_count = sum(vc for (_l, _s, _t, vc) in variants)
+            residual_time = max(0.0, total_time - labeled_time)
+            residual_count = max(0, total_count - labeled_count)
+            show_other = (residual_count > 0
+                          and total_time > 0
+                          and residual_time >= total_time * 0.01)
+            total_rows = len(variants) + (1 if show_other else 0)
+            for i, (vlabel, _sig, vtime, vcount) in enumerate(variants):
+                connector = "└── " if i == total_rows - 1 else "├── "
+                vpct = vtime / grand_total * 100 if grand_total > 0 else 0
+                tab = self._format_detail_sheet_name(mtype, phase_used, vlabel)
+                label = f"{parent_indent}    {connector}({vlabel}) {vcount}x"
+                print(f"  {label:<45s} {vtime:>14,.1f} {vpct:>6.1f}%  {tab}")
+            if show_other:
+                vpct = residual_time / grand_total * 100 if grand_total > 0 else 0
+                label = f"{parent_indent}    └── (other) {residual_count}x"
+                print(f"  {label:<45s} {residual_time:>14,.1f} {vpct:>6.1f}%")
 
         # --- Section 1: Kernel Time Summary (with hierarchy) ---
         print("\n" + "=" * 90)
@@ -1424,26 +1465,40 @@ class ReportGenerator:
             pct = rtype_total / grand_total * 100 if grand_total > 0 else 0
             chain = root_chains.get(rtype, [rtype])
             root_phase = self._infer_root_phase(rlist)
-            print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%")
-            if len(chain) > 1:
-                scoped_totals: Dict[str, float] = defaultdict(float)
-                self._collect_by_type_total(rlist, scoped_totals, mode)
-                children = chain[1:]
-                for i, ctype in enumerate(children):
-                    is_last = (i == len(children) - 1)
-                    connector = "└── " if is_last else "├── "
-                    ct = scoped_totals.get(ctype, 0)
-                    ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
-                    label = f"    {connector}{ctype}"
-                    if ctype in top_type_names:
-                        if root_phase:
-                            suffix = f" ({root_phase[:3]})"
-                            tab = f"{ctype[:28 - len(suffix)]}{suffix}"
-                        else:
-                            tab = ctype[:28]
+            root_tab = ""
+            if rtype in top_type_names and len(chain) == 1:
+                root_info, root_phase_used = _lookup_variants(rtype, root_phase)
+                if root_info:
+                    root_tab = self._format_detail_sheet_name(
+                        rtype, root_phase_used, root_info["variants"][0][0])
+                else:
+                    root_tab = self._format_detail_sheet_name(
+                        rtype, root_phase, "")
+            print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%  {root_tab}")
+            if len(chain) == 1:
+                _print_variant_rows("", rtype, root_phase)
+                continue
+            scoped_totals: Dict[str, float] = defaultdict(float)
+            self._collect_by_type_total(rlist, scoped_totals, mode)
+            children = chain[1:]
+            for i, ctype in enumerate(children):
+                is_last = (i == len(children) - 1)
+                connector = "└── " if is_last else "├── "
+                ct = scoped_totals.get(ctype, 0)
+                ct_pct = ct / grand_total * 100 if grand_total > 0 else 0
+                label = f"    {connector}{ctype}"
+                tab = ""
+                if ctype in top_type_names:
+                    child_info, child_phase_used = _lookup_variants(
+                        ctype, root_phase)
+                    if child_info:
+                        tab = self._format_detail_sheet_name(
+                            ctype, child_phase_used, child_info["variants"][0][0])
                     else:
-                        tab = ""
-                    print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
+                        tab = self._format_detail_sheet_name(
+                            ctype, root_phase, "")
+                print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
+                _print_variant_rows("    ", ctype, root_phase)
 
         # --- Section 2: Category breakdown ---
         global_cat_agg: Dict[str, List] = {}
@@ -1558,6 +1613,7 @@ class ReportGenerator:
     def export_excel(self, stats_list: List[ModuleStats], mode: str,
                      output_path: str, max_detail_modules: int = 3,
                      detail_modules: Optional[List[str]] = None,
+                     detail_instances: Optional[List[int]] = None,
 ):
         """Export analysis to Excel workbook."""
         try:
@@ -1593,6 +1649,12 @@ class ReportGenerator:
             top_type_names, _, _, _, _ = \
                 self._select_max_detail_modules(stats_list, mode, max_detail_modules)
 
+        # Pre-compute A/B/C structural variants per (module_type, phase). These
+        # drive both the Summary tab's variant rows and the per-variant detail
+        # sheets so that labels stay consistent.
+        variant_labels, variant_aggregates = self._compute_variant_aggregates(
+            stats_list, mode)
+
         # --- Summary tab (one-pager overview) ---
         ws_summary = wb.active
         ws_summary.title = "Summary"
@@ -1600,7 +1662,7 @@ class ReportGenerator:
             ws_summary, stats_list, mode, grand_total,
             total_kernel_count, global_cat_agg,
             header_font, header_fill, title_font,
-            top_type_names)
+            top_type_names, variant_aggregates)
 
         # --- Overview sheet (hierarchical type tree, with % of Parent + stats) ---
         ws_ov = wb.create_sheet(title="Overview")
@@ -1623,18 +1685,51 @@ class ReportGenerator:
                 for s in x[1]))
         type_row = 2
         for rtype, rlist in sorted_root_types:
-            root_times = [(s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
-                          for s in rlist]
-            rep = next((s for s in rlist if s.instance_id == 1), rlist[0])
-            rep_time = rep.total_kernel_time if mode == "full" else rep.total_cpu_op_time
-            root_rep_kernel = self._get_rep_kernel(rep, mode)
-            self._write_type_row(ws_ov, type_row, rtype, 0, len(rlist),
-                                 root_times, grand_total, bold=True,
-                                 rep_kernel=root_rep_kernel)
-            type_row += 1
-            if rep.children_stats:
-                type_row, _ = self._write_children_hierarchy(
-                    ws_ov, rep, mode, type_row, rep_time, rlist)
+            # Detect structural variants among root instances
+            _sig_groups: Dict[frozenset, List[ModuleStats]] = defaultdict(list)
+            for s in rlist:
+                _sig_groups[self._children_signature(s)].append(s)
+            # Filter to significant variants (>= 10% of total instances)
+            min_count = max(1, len(rlist) // 10)
+            sig_variants = {k: v for k, v in _sig_groups.items()
+                            if len(v) >= min_count}
+            if not sig_variants:
+                sig_variants = _sig_groups
+            if len(sig_variants) <= 1:
+                root_times = [(s.total_kernel_time if mode == "full"
+                               else s.total_cpu_op_time) for s in rlist]
+                rep = next((s for s in rlist if s.instance_id == 1), rlist[0])
+                rep_time = (rep.total_kernel_time if mode == "full"
+                            else rep.total_cpu_op_time)
+                root_rep_kernel = self._get_rep_kernel(rep, mode)
+                self._write_type_row(ws_ov, type_row, rtype, 0, len(rlist),
+                                     root_times, grand_total, bold=True,
+                                     rep_kernel=root_rep_kernel)
+                type_row += 1
+                if rep.children_stats:
+                    type_row, _ = self._write_children_hierarchy(
+                        ws_ov, rep, mode, type_row, rep_time, rlist)
+            else:
+                sorted_variants = sorted(
+                    sig_variants.values(), key=lambda g: -len(g))
+                for vi, vlist in enumerate(sorted_variants):
+                    vlabel = chr(ord('A') + vi)
+                    vtimes = [(s.total_kernel_time if mode == "full"
+                               else s.total_cpu_op_time) for s in vlist]
+                    deduped_v = self._dedup_by_instance_id(vlist, mode)
+                    vrep = deduped_v[len(deduped_v) // 2]
+                    vrep_time = (vrep.total_kernel_time if mode == "full"
+                                 else vrep.total_cpu_op_time)
+                    vrep_kernel = self._get_rep_kernel(vrep, mode)
+                    vlbl = f"{rtype} ({vlabel}: {vrep.name})"
+                    self._write_type_row(
+                        ws_ov, type_row, vlbl, 0, len(vlist),
+                        vtimes, grand_total, bold=True,
+                        rep_kernel=vrep_kernel)
+                    type_row += 1
+                    if vrep.children_stats:
+                        type_row, _ = self._write_children_hierarchy(
+                            ws_ov, vrep, mode, type_row, vrep_time, vlist)
         ws_ov.column_dimensions["A"].width = 40
         ws_ov.column_dimensions["J"].width = 80
 
@@ -1652,10 +1747,10 @@ class ReportGenerator:
         tree_row = 2
         seen_tree_roots: set = set()
         for s in stats_list:
-            # Show one representative instance per root module type
-            if s.module_type in seen_tree_roots:
+            key = (s.module_type, s.instance_id)
+            if key in seen_tree_roots:
                 continue
-            seen_tree_roots.add(s.module_type)
+            seen_tree_roots.add(key)
             tree_row = self._write_tree_rows(ws_tree, s, mode, tree_row, 0)
         ws_tree.column_dimensions["A"].width = 50
         ws_tree.column_dimensions["D"].width = 60
@@ -1681,26 +1776,87 @@ class ReportGenerator:
         # Seed detail-sheet representatives from the Module Tree instances so
         # that the detail tab numbers match the tree.  _find_median_instance
         # only fills types not already present.
-        seen_types: Dict[Tuple[str, str], ModuleStats] = {}
+        seen_types: Dict[Tuple[str, str, frozenset], ModuleStats] = {}
+        seen_tree_types = set()
+        root_module_types = {s.module_type for s in stats_list}
         for s in stats_list:
-            if s.module_type in seen_tree_roots:
-                self._collect_tree_instances(s, seen_types)
-                break  # only the first root was written to the tree
+            if (s.module_type, s.instance_id) in seen_tree_roots:
+                self._collect_tree_instances(s, seen_types,
+                                            skip_types=root_module_types)
+                seen_tree_types.add(s.module_type)
         self._find_median_instance_per_type(stats_list, seen_types, mode,
                                             force_types=top_type_names)
+        # Drop rare variants (those not in variant_labels for (mtype, phase)
+        # groups that have >= 2 significant variants) so they don't get their
+        # own detail sheet.
+        _grouped_sigs: Dict[Tuple[str, str], List[frozenset]] = defaultdict(list)
+        for mtype, phase, sig in seen_types:
+            _grouped_sigs[(mtype, phase)].append(sig)
+        _rare_keys: List[Tuple[str, str, frozenset]] = []
+        for (mtype, phase), sigs in _grouped_sigs.items():
+            if (mtype, phase) not in variant_aggregates:
+                continue  # group has 0 or 1 significant variants — keep all
+            significant_sigs = {v[1] for v in
+                                variant_aggregates[(mtype, phase)]["variants"]}
+            for sg in sigs:
+                if sg not in significant_sigs:
+                    _rare_keys.append((mtype, phase, sg))
+        for key in _rare_keys:
+            seen_types.pop(key, None)
+        # When --detail-instance is specified, collect those specific instances
+        # and skip the normal variant-based sheets for their types.
+        instance_override_types: set = set()
+        instance_detail_list: List[Tuple[ModuleStats, str]] = []
+        if detail_instances:
+            all_by_type_for_inst: Dict[str, List[ModuleStats]] = defaultdict(list)
+            self._collect_instances_by_type(stats_list, all_by_type_for_inst)
+            requested = set(detail_instances)
+            for mtype in top_type_names:
+                matches = [s for s in all_by_type_for_inst.get(mtype, [])
+                           if s.instance_id in requested]
+                if matches:
+                    instance_override_types.add(mtype)
+                    best_per_id: Dict[int, ModuleStats] = {}
+                    for s in matches:
+                        prev = best_per_id.get(s.instance_id)
+                        if prev is None:
+                            best_per_id[s.instance_id] = s
+                        else:
+                            s_time = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+                            prev_time = prev.total_kernel_time if mode == "full" else prev.total_cpu_op_time
+                            if s_time > prev_time:
+                                best_per_id[s.instance_id] = s
+                    for iid in sorted(best_per_id):
+                        s = best_per_id[iid]
+                        phase = getattr(s, "phase", "")
+                        phase_suffix = f" ({phase[:3]})" if phase else ""
+                        sname = f"{s.name}{phase_suffix}"[:31]
+                        instance_detail_list.append((s, sname))
+            not_found = requested - {s.instance_id for s, _ in instance_detail_list}
+            if not_found:
+                print(f"  WARNING: instance IDs not found: {sorted(not_found)}")
+
         # Sort detail tabs by total kernel time descending (highest % first)
         sorted_detail_items = sorted(
             seen_types.items(),
             key=lambda item: -type_total_time.get(item[0][0], 0))
-        for (mtype, phase), rep_stats in sorted_detail_items:
+        # Append user-specified instance sheets
+        for inst_stats, sname in instance_detail_list:
+            sorted_detail_items.append(
+                ((inst_stats.module_type, getattr(inst_stats, "phase", ""),
+                  frozenset()), inst_stats))
+        for (mtype, phase, sig), rep_stats in sorted_detail_items:
             if mtype not in top_type_names:
                 continue
-            # Include phase suffix in sheet name for LLM traces
-            if phase:
-                suffix = f" ({phase[:3]})"  # "prefill" -> "(pre)", "decode" -> "(dec)"
-                sheet_name = f"{mtype[:28 - len(suffix)]}{suffix}"
+            # Skip variant-based sheets for types with user-specified instances
+            if mtype in instance_override_types and sig != frozenset():
+                continue
+            if mtype in instance_override_types:
+                sheet_name = [sn for s, sn in instance_detail_list
+                              if s is rep_stats][0]
             else:
-                sheet_name = mtype[:28]  # Excel sheet name limit = 31 chars
+                vlabel = variant_labels.get((mtype, phase, sig), "")
+                sheet_name = self._format_detail_sheet_name(mtype, phase, vlabel)
             ws_det = wb.create_sheet(title=sheet_name)
             all_details = self._collect_all_details(rep_stats)
             all_details.sort(key=lambda d: d.ts)
@@ -1882,9 +2038,18 @@ class ReportGenerator:
                            grand_total: float, total_kernel_count: int,
                            global_cat_agg: Dict[str, List],
                            header_font, header_fill, title_font,
-                           top_type_names: set):
-        """Write the Summary tab: kernel time summary with detail tabs, category breakdown."""
+                           top_type_names: set,
+                           variant_aggregates: Optional[Dict] = None):
+        """Write the Summary tab: kernel time summary with detail tabs, category breakdown.
+
+        When a (module_type, phase) group has multiple A/B/C structural
+        variants (computed in `_compute_variant_aggregates`), this tab expands
+        the matching row into one sub-row per variant pointing at its
+        dedicated detail sheet.
+        """
         from openpyxl.styles import Font, PatternFill
+
+        variant_aggregates = variant_aggregates or {}
 
         # Build wrapper chains
         root_chains: Dict[str, List[str]] = {}
@@ -1896,6 +2061,77 @@ class ReportGenerator:
                 rtype, wrapper_types, type_children_map, stats_list, mode)
             root_chains[rtype] = chain
         top_type_set = top_type_names
+
+        def _lookup_variants(mtype: str, phase: str):
+            """Look up variants for (mtype, phase) with fallback to empty phase.
+
+            Root-level instances often have empty `phase` (the PhaseDetector
+            only tags children), so variant_aggregates may be keyed under
+            (mtype, "") while Summary's `_infer_root_phase` returns
+            "prefill"/"decode" from the children.  Return (info, phase_used)
+            where info is the aggregate dict and phase_used is what should be
+            passed to `_format_detail_sheet_name` so the referenced sheet name
+            matches what the detail-sheet loop actually creates.
+            """
+            info = variant_aggregates.get((mtype, phase))
+            if info is not None:
+                return info, phase
+            info = variant_aggregates.get((mtype, ""))
+            if info is not None:
+                return info, ""
+            return None, phase
+
+        def _write_variant_rows(parent_indent: str, mtype: str, phase: str):
+            """Emit one indented sub-row per A/B/C variant under a parent row.
+
+            When the labeled variants don't cover the full (mtype, phase)
+            group (rare signatures were filtered), emit a trailing "(other)"
+            row so the children visibly account for the parent total.
+            """
+            nonlocal row
+            if mtype not in top_type_set:
+                return
+            info, phase_used = _lookup_variants(mtype, phase)
+            if not info:
+                return
+            variants = info["variants"]
+            total_time = info["total_time"]
+            total_count = info["total_count"]
+            child_indent = parent_indent + "    "
+            labeled_time = sum(vt for (_l, _s, vt, _c) in variants)
+            labeled_count = sum(vc for (_l, _s, _t, vc) in variants)
+            residual_time = max(0.0, total_time - labeled_time)
+            residual_count = max(0, total_count - labeled_count)
+            show_other = (residual_count > 0
+                          and total_time > 0
+                          and residual_time >= total_time * 0.01)
+            total_rows = len(variants) + (1 if show_other else 0)
+            for i, (label, _sig, vtime, vcount) in enumerate(variants):
+                is_last = (i == total_rows - 1)
+                connector = "└── " if is_last else "├── "
+                vpct = vtime / grand_total * 100 if grand_total > 0 else 0
+                detail_ref = self._format_detail_sheet_name(
+                    mtype, phase_used, label)
+                ws.cell(row=row, column=1,
+                        value=f"{child_indent}{connector}({label}) {vcount}x")
+                ws.cell(row=row, column=2, value=round(vtime, 1))
+                ws.cell(row=row, column=3, value=f"{vpct:.1f}%")
+                ws.cell(row=row, column=4, value=detail_ref)
+                for c in range(1, 5):
+                    ws.cell(row=row, column=c).font = Font(
+                        italic=True, color="555555")
+                row += 1
+            if show_other:
+                ws.cell(row=row, column=1,
+                        value=f"{child_indent}└── (other) {residual_count}x")
+                ws.cell(row=row, column=2, value=round(residual_time, 1))
+                ws.cell(row=row, column=3,
+                        value=f"{residual_time / grand_total * 100:.1f}%"
+                              if grand_total > 0 else "")
+                for c in range(1, 5):
+                    ws.cell(row=row, column=c).font = Font(
+                        italic=True, color="888888")
+                row += 1
 
         row = 1
 
@@ -1932,8 +2168,25 @@ class ReportGenerator:
             ws.cell(row=row, column=1, value=rtype)
             ws.cell(row=row, column=2, value=round(rtype_total, 1))
             ws.cell(row=row, column=3, value=f"{pct:.1f}%")
+            # Reference detail tab when the root itself has a detail sheet AND
+            # has no further wrapper-chain children to expand.
+            if rtype in top_type_set and len(chain) == 1:
+                root_info, root_phase_used = _lookup_variants(rtype, root_phase)
+                if root_info:
+                    first_label = root_info["variants"][0][0]
+                    ws.cell(row=row, column=4,
+                            value=self._format_detail_sheet_name(
+                                rtype, root_phase_used, first_label))
+                else:
+                    ws.cell(row=row, column=4,
+                            value=self._format_detail_sheet_name(
+                                rtype, root_phase, ""))
             row += 1
-            if len(chain) > 1:
+            # Expand variants for root types with no chain (e.g. extend
+            # DeepseekV4DecoderLayer → variants A/B).
+            if len(chain) == 1:
+                _write_variant_rows("", rtype, root_phase)
+            else:
                 scoped_totals: Dict[str, float] = defaultdict(float)
                 self._collect_by_type_total(rlist, scoped_totals, mode)
                 children = chain[1:]
@@ -1946,15 +2199,23 @@ class ReportGenerator:
                     ws.cell(row=row, column=2, value=round(ct, 1))
                     ws.cell(row=row, column=3, value=f"{ct_pct:.1f}%")
                     if ctype in top_type_set:
-                        if root_phase:
-                            suffix = f" ({root_phase[:3]})"
-                            detail_ref = f"{ctype[:28 - len(suffix)]}{suffix}"
+                        # If the chain leaf has variants, point at the first
+                        # variant tab; per-variant rows are emitted below.
+                        child_info, child_phase_used = _lookup_variants(
+                            ctype, root_phase)
+                        if child_info:
+                            first_label = child_info["variants"][0][0]
+                            detail_ref = self._format_detail_sheet_name(
+                                ctype, child_phase_used, first_label)
                         else:
-                            detail_ref = ctype[:28]
+                            detail_ref = self._format_detail_sheet_name(
+                                ctype, root_phase, "")
                         ws.cell(row=row, column=4, value=detail_ref)
                         for c in range(1, 5):
                             ws.cell(row=row, column=c).font = Font(bold=True)
                     row += 1
+                    # Indent variant rows under this chain child.
+                    _write_variant_rows("    ", ctype, root_phase)
 
         row += 1  # blank row
 
@@ -2157,13 +2418,15 @@ class ReportGenerator:
 
         return self._get_rep_kernel(best_type_rep, mode)
 
+    _TREE_MAX_ROWS = 5000
+
     def _write_tree_rows(self, ws, stats: ModuleStats, mode: str,
                          row: int, depth: int, max_depth: int = 3) -> int:
         """Write tree-structured rows with Excel outline grouping for collapse/expand."""
         if depth > max_depth:
             return row
-        if row > MAX_ROWS_PER_TAB + 1:
-            ws.cell(row=row, column=1, value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+        if row > self._TREE_MAX_ROWS + 1:
+            ws.cell(row=row, column=1, value=f"... truncated at {self._TREE_MAX_ROWS} rows")
             return row + 1
         time_val = stats.total_kernel_time if mode == "full" else stats.total_cpu_op_time
         count = stats.kernel_count if mode == "full" else stats.cpu_op_count
@@ -2350,54 +2613,117 @@ class ReportGenerator:
         return chain
 
     @staticmethod
+    def _children_signature(stats: ModuleStats, depth: int = 2) -> frozenset:
+        """Structural fingerprint from children module types (recursive to *depth*).
+
+        Depth=2 captures grandchildren, so e.g. DeepseekV4DecoderLayer
+        instances whose MQALayer children differ (C4Indexer vs Compressor)
+        produce different signatures.
+
+        For leaf modules (no children_stats) we fall back to the kernel
+        category breakdown (category + count) so that synthetic CUDA-graph
+        decode layers — which are named "Layer_X" and carry kernels
+        directly — can be split into structural variants even when two
+        variants share the same set of categories but differ in kernel
+        counts (e.g. 27-kernel vs 43-kernel layers in DeepSeek-V4).
+        """
+        if depth <= 0:
+            return frozenset()
+        if not stats.children_stats:
+            if stats.kernel_breakdown:
+                return frozenset(
+                    ("__kc__", cat, count)
+                    for cat, (_dur, count) in stats.kernel_breakdown.items())
+            return frozenset()
+        from collections import Counter
+        child_sigs = Counter()
+        for c in stats.children_stats:
+            sub = ReportGenerator._children_signature(c, depth - 1)
+            child_sigs[(c.module_type, sub)] += 1
+        return frozenset(child_sigs.items())
+
+    @staticmethod
     def _collect_tree_instances(root_stats: ModuleStats,
-                                out: Dict[Tuple[str, str], ModuleStats]):
-        """Collect first instance of each (module_type, phase) from a tree.
+                                out: Dict[Tuple[str, str, frozenset], ModuleStats],
+                                skip_types: Optional[set] = None):
+        """Collect first instance of each (module_type, phase, signature) from a tree.
 
         Walks the same tree that _write_tree_rows renders in the Module Tree
-        tab, recording the first instance per (type, phase) pair.  These are
-        used to seed the detail-sheet representatives so that detail tabs
-        show the exact same instances visible in the tree.
+        tab, recording the first instance per (type, phase, structure) triple.
+        These are used to seed the detail-sheet representatives so that detail
+        tabs show the exact same instances visible in the tree.
+
+        skip_types: module types to skip seeding (let median selection handle
+        them instead — used for root-level types with many instances).
+
+        Skips children of CudaGraphReplay nodes — those are synthetic layers
+        where ordering is arbitrary; median selection picks better reps.
         """
-        key = (root_stats.module_type, getattr(root_stats, "phase", ""))
-        if key not in out and root_stats.kernel_count > 0:
-            out[key] = root_stats
+        if not (skip_types and root_stats.module_type in skip_types):
+            sig = ReportGenerator._children_signature(root_stats)
+            key = (root_stats.module_type, getattr(root_stats, "phase", ""), sig)
+            if key not in out and root_stats.kernel_count > 0:
+                out[key] = root_stats
+        if root_stats.module_type.startswith("CudaGraphReplay"):
+            return
         for child in root_stats.children_stats:
-            ReportGenerator._collect_tree_instances(child, out)
+            ReportGenerator._collect_tree_instances(child, out, skip_types)
+
+    @staticmethod
+    def _dedup_by_instance_id(instances: List[ModuleStats],
+                              mode: str) -> List[ModuleStats]:
+        """Keep one instance per unique instance_id (the one with most kernel time)."""
+        best: Dict[int, ModuleStats] = {}
+        for s in instances:
+            prev = best.get(s.instance_id)
+            if prev is None:
+                best[s.instance_id] = s
+            else:
+                s_time = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+                prev_time = prev.total_kernel_time if mode == "full" else prev.total_cpu_op_time
+                if s_time > prev_time:
+                    best[s.instance_id] = s
+        return sorted(best.values(), key=lambda s: s.instance_id)
 
     def _find_median_instance_per_type(self, stats_list: List[ModuleStats],
-                                       seen: Dict[Tuple[str, str], ModuleStats],
+                                       seen: Dict[Tuple[str, str, frozenset], ModuleStats],
                                        mode: str,
                                        force_types: Optional[set] = None):
-        """Find median instance of each (module_type, phase) pair.
+        """Find median instance of each (module_type, phase, signature) triple.
 
-        Groups by (module_type, phase) so that prefill and decode get separate
-        representative instances, producing separate detail sheets.
-        Skips (type, phase) pairs already present in *seen* (e.g. seeded
-        from the Module Tree) so that detail tabs stay consistent with
-        the tree.
+        Groups by (module_type, phase) then sub-groups by structural signature
+        so that structurally different instances (e.g. layers with C4Indexer vs
+        Compressor) get separate representative instances and detail sheets.
+
+        Within each group, deduplicates by instance_id (keeping the instance
+        with the most kernels) so that median position reflects unique layers
+        rather than repeated forward passes.
+
+        Skips triples already present in *seen* (e.g. seeded from Module Tree).
 
         force_types: if given, always include these types even if they are leaf modules.
         """
-        # First collect all instances per type
         all_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
         self._collect_instances_by_type(stats_list, all_by_type)
-        # Pick median for each (type, phase) pair
         for mtype, instances in all_by_type.items():
             if not any(s.children_stats for s in instances):
                 if not (force_types and mtype in force_types):
                     continue
-            # Sub-group by phase
             by_phase: Dict[str, List[ModuleStats]] = defaultdict(list)
             for s in instances:
                 by_phase[getattr(s, "phase", "")].append(s)
             for phase, phase_instances in by_phase.items():
-                if (mtype, phase) in seen:
-                    continue
-                timed = sorted(phase_instances,
-                               key=lambda s: s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
-                mid = len(timed) // 2
-                seen[(mtype, phase)] = timed[mid]
+                by_sig: Dict[frozenset, List[ModuleStats]] = defaultdict(list)
+                for s in phase_instances:
+                    sig = ReportGenerator._children_signature(s)
+                    by_sig[sig].append(s)
+                for sig, sig_instances in by_sig.items():
+                    key = (mtype, phase, sig)
+                    if key in seen:
+                        continue
+                    deduped = self._dedup_by_instance_id(sig_instances, mode)
+                    mid = len(deduped) // 2
+                    seen[key] = deduped[mid]
 
     def _collect_instances_by_type(self, stats_list: List[ModuleStats],
                                    out: Dict[str, List[ModuleStats]]):
@@ -2405,6 +2731,86 @@ class ReportGenerator:
             if s.kernel_count > 0:
                 out[s.module_type].append(s)
             self._collect_instances_by_type(s.children_stats, out)
+
+    def _compute_variant_aggregates(self, stats_list: List[ModuleStats],
+                                    mode: str):
+        """Detect A/B/C structural variants per (module_type, phase) group.
+
+        A group has multiple variants when its instances produce more than one
+        distinct `_children_signature` (which falls back to the kernel-category
+        set for leaf modules — e.g. the synthetic decode "Layer_X" nodes).
+
+        A signature is considered "significant" when it covers >= 10% of the
+        group's instance count OR >= 10% of the group's total time.  The
+        time-based check is important for traces where a few instances (e.g.
+        warmup / CUDA-graph capture iterations) dominate runtime even though
+        they are count-rare; without it, A+B would only account for a small
+        slice of the parent total in the Summary tab.
+
+        Returns:
+          labels:     dict (mtype, phase, sig) -> 'A' | 'B' | ...
+          aggregates: dict (mtype, phase) -> [(label, sig, total_time, count), ...]
+                      ordered A, B, C ... (most frequent variant first).
+                      Only populated for (mtype, phase) with >= 2 significant
+                      variants.
+        """
+        def _time_of(s):
+            return s.total_kernel_time if mode == "full" else s.total_cpu_op_time
+
+        all_by_type: Dict[str, List[ModuleStats]] = defaultdict(list)
+        self._collect_instances_by_type(stats_list, all_by_type)
+        labels: Dict[Tuple[str, str, frozenset], str] = {}
+        aggregates: Dict[Tuple[str, str], Dict] = {}
+        for mtype, instances in all_by_type.items():
+            by_phase: Dict[str, List[ModuleStats]] = defaultdict(list)
+            for s in instances:
+                by_phase[getattr(s, "phase", "")].append(s)
+            for phase, phase_instances in by_phase.items():
+                sig_groups: Dict[frozenset, List[ModuleStats]] = defaultdict(list)
+                for s in phase_instances:
+                    sig_groups[ReportGenerator._children_signature(s)].append(s)
+                if len(sig_groups) <= 1:
+                    continue
+                total_count = len(phase_instances)
+                total_time = sum(_time_of(s) for s in phase_instances)
+                min_count = max(1, total_count // 10)
+                min_time = total_time * 0.1
+                significant = []
+                for sg, group in sig_groups.items():
+                    gtime = sum(_time_of(s) for s in group)
+                    if len(group) >= min_count or gtime >= min_time:
+                        significant.append((sg, group, gtime))
+                if len(significant) <= 1:
+                    continue
+                significant.sort(key=lambda x: -len(x[1]))
+                variants = []
+                for i, (sg, group, gtime) in enumerate(significant):
+                    label = chr(ord('A') + i)
+                    labels[(mtype, phase, sg)] = label
+                    variants.append((label, sg, gtime, len(group)))
+                aggregates[(mtype, phase)] = {
+                    "variants": variants,
+                    "total_count": total_count,
+                    "total_time": total_time,
+                }
+        return labels, aggregates
+
+    @staticmethod
+    def _format_detail_sheet_name(mtype: str, phase: str, vlabel: str) -> str:
+        """Build the per-(type, phase, variant) detail-sheet name.
+
+        Excel limits sheet names to 31 chars; we truncate `mtype` to leave
+        room for the " (pre)" / " (dec,A)" suffix.
+        """
+        suffixes = []
+        if phase:
+            suffixes.append(phase[:3])
+        if vlabel:
+            suffixes.append(vlabel)
+        if suffixes:
+            suffix = f" ({','.join(suffixes)})"
+            return f"{mtype[:28 - len(suffix)]}{suffix}"
+        return mtype[:28]
 
     def _write_kernel_name_breakdown(self, ws, stats_list: List[ModuleStats],
                                      mode: str, row: int,
@@ -2458,6 +2864,8 @@ class TraceModuleAnalyzer:
                  output_path: Optional[str] = None,
                  detail_modules: Optional[List[str]] = None,
                  module_index: Optional[int] = None,
+                 detail_instances: Optional[List[int]] = None,
+                 phase_index=None,
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
@@ -2466,6 +2874,8 @@ class TraceModuleAnalyzer:
         self.output_path = output_path
         self.detail_modules = detail_modules or []
         self.module_index = module_index
+        self.detail_instances = detail_instances
+        self.phase_index = phase_index
         self.max_detail_modules = max_detail_modules
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
@@ -2504,6 +2914,8 @@ class TraceModuleAnalyzer:
         gpu_memset = []
         phase_markers = []  # (ts, phase, tid, pid) for prefill/decode detection
 
+        gpu_user_annotations = []  # ATOM-style GPU-side phase markers
+
         MODULE_PREFIX = "nn.Module: "
         for e in events:
             cat = e.get("cat", "")
@@ -2519,6 +2931,9 @@ class TraceModuleAnalyzer:
                 gpu_memcpy.append(e)
             elif cat == "gpu_memset":
                 gpu_memset.append(e)
+            elif cat == "gpu_user_annotation":
+                if e.get("dur") is not None:
+                    gpu_user_annotations.append(e)
             elif cat == "python_function":
                 name = e.get("name", "")
                 if name.startswith(MODULE_PREFIX) and e.get("dur") is not None:
@@ -2548,12 +2963,55 @@ class TraceModuleAnalyzer:
         print(f"  python_function events: {len(pyfunc_events):,}")
         print(f"  gpu_memcpy events: {len(gpu_memcpy):,}")
         print(f"  gpu_memset events: {len(gpu_memset):,}")
+        print(f"  gpu_user_annotation events: {len(gpu_user_annotations):,}")
         print(f"  phase markers: {len(phase_markers):,}")
         print(f"  Mode: {mode}")
 
         # Step 2: Build module hierarchy tree
         print(f"  {_elapsed()} event categorization done")
         if not module_events:
+            # Try ATOM-style traces: gpu_user_annotation with prefill/decode spans
+            atom_phases = [e for e in gpu_user_annotations
+                           if e.get("name", "").startswith(("prefill[", "decode["))]
+            if atom_phases and kernel_events:
+                print("\nNo nn.Module events found. Detected ATOM-style trace with "
+                      f"{len(atom_phases)} gpu_user_annotation phase spans.")
+                print("Building synthetic module hierarchy from GPU phase annotations...")
+                roots = self._build_atom_module_tree(
+                    atom_phases, kernel_events + gpu_memcpy + gpu_memset)
+                del gpu_user_annotations
+                if roots:
+                    # Skip normal correlation — kernels already assigned to nodes
+                    print(f"  {_elapsed()} ATOM module hierarchy built")
+                    phase_detector = PhaseDetector()
+                    phase_detector.detect_from_markers(roots, phase_markers)
+                    self._propagate_phase(roots)
+
+                    print(f"  {_elapsed()} phase detection done")
+                    print("\nAggregating module statistics...")
+                    aggregator = ModuleAggregator()
+                    stats_list = aggregator.aggregate(roots, mode)
+                    self._copy_phase_to_stats(roots, stats_list)
+                    stats_list = self._filter_by_phase_index(stats_list)
+
+                    print(f"  {_elapsed()} aggregation done")
+                    reporter = ReportGenerator()
+                    reporter.print_type_summary(stats_list, mode,
+                                                max_detail_modules=self.max_detail_modules,
+                                                detail_modules=self.detail_modules)
+                    for dm in self.detail_modules:
+                        reporter.print_layer_detail(stats_list, mode, dm,
+                                                    self.module_index)
+                    print(f"  {_elapsed()} console output done")
+
+                    xlsx_path = self.output_path
+                    if xlsx_path:
+                        reporter.export_excel(stats_list, mode, xlsx_path,
+                                              max_detail_modules=self.max_detail_modules,
+                                              detail_modules=self.detail_modules,
+                                              detail_instances=self.detail_instances)
+                        print(f"  {_elapsed()} excel export done")
+                    return
             print("\nWARNING: No nn.Module events found. Trace may not have been captured "
                   "with `with_modules=True`.")
             print("Falling back to basic kernel-only analysis.")
@@ -2632,6 +3090,7 @@ class TraceModuleAnalyzer:
         stats_list = aggregator.aggregate(roots, mode)
         # Propagate phase from nodes
         self._copy_phase_to_stats(roots, stats_list)
+        stats_list = self._filter_by_phase_index(stats_list)
 
         print(f"  {_elapsed()} aggregation done")
         # Step 6: Output
@@ -2661,7 +3120,8 @@ class TraceModuleAnalyzer:
         if xlsx_path:
             reporter.export_excel(stats_list, mode, xlsx_path,
                                   max_detail_modules=self.max_detail_modules,
-                                  detail_modules=self.detail_modules)
+                                  detail_modules=self.detail_modules,
+                                  detail_instances=self.detail_instances)
             print(f"  {_elapsed()} excel export done")
 
         if self.model_info and xlsx_path:
@@ -2699,6 +3159,124 @@ class TraceModuleAnalyzer:
             stats.phase = getattr(node, "_phase", "")
             self._copy_phase_to_stats(node.children, stats.children_stats)
 
+    def _filter_by_phase_index(self, stats_list: List[ModuleStats]) -> List[ModuleStats]:
+        if self.phase_index is None:
+            return stats_list
+        val = self.phase_index
+        if isinstance(val, int):
+            filtered = [s for s in stats_list if s.instance_id == val]
+        else:
+            filtered = [s for s in stats_list if s.name == val]
+        kept = [s.name for s in filtered]
+        dropped = len(stats_list) - len(filtered)
+        if kept:
+            print(f"  --phase-index {val}: kept {', '.join(kept)} "
+                  f"(dropped {dropped} other roots)")
+        else:
+            print(f"  WARNING: --phase-index {val} matched no roots. "
+                  f"Available: {', '.join(s.name for s in stats_list)}")
+        return filtered
+
+    def _build_atom_module_tree(self, gpu_phase_events: List[Dict],
+                                all_gpu_events: List[Dict]) -> List[ModuleNode]:
+        """Build synthetic module hierarchy from ATOM gpu_user_annotation spans.
+
+        ATOM traces lack nn.Module events but have gpu_user_annotation spans
+        like "prefill[bs=1 tok=7112 ctx=7112]" and "decode[bs=4 tok=4 d=4]"
+        that contain GPU kernels by timestamp.  Within each span, COMM-based
+        segmentation splits kernels into layer-like groups.
+
+        Multi-stream dedup: the same iteration may have spans on multiple GPU
+        streams.  We pick the stream with the most spans (the "main" compute
+        stream) and ignore duplicates on other streams.
+        """
+        # Pick the stream with the most phase spans as the primary stream
+        stream_counts: Dict[int, int] = defaultdict(int)
+        for e in gpu_phase_events:
+            stream_counts[e.get("tid", 0)] += 1
+        primary_tid = max(stream_counts, key=stream_counts.get)  # type: ignore[arg-type]
+        phase_events = sorted(
+            [e for e in gpu_phase_events if e.get("tid", 0) == primary_tid],
+            key=lambda e: e.get("ts", 0))
+        print(f"  Primary GPU stream tid={primary_tid} "
+              f"({len(phase_events)} of {len(gpu_phase_events)} spans)")
+
+        gpu_events_sorted = sorted(all_gpu_events, key=lambda e: e.get("ts", 0))
+        gpu_ts = [e.get("ts", 0) for e in gpu_events_sorted]
+
+        graph_correlator = CudaGraphCorrelator.__new__(CudaGraphCorrelator)
+        graph_correlator._graph_corrs = set()
+
+        roots = []
+        prefill_idx = 0
+        decode_idx = 0
+        total_matched = 0
+
+        for pe in phase_events:
+            name = pe.get("name", "")
+            ts = pe["ts"]
+            dur = pe["dur"]
+            end = ts + dur
+            tid = pe.get("tid", 0)
+            pid = pe.get("pid", 0)
+
+            is_prefill = name.startswith("prefill[")
+            phase = "prefill" if is_prefill else "decode"
+
+            if is_prefill:
+                root_type = "Prefill"
+                root_id = prefill_idx
+                prefill_idx += 1
+            else:
+                root_type = "Decode"
+                root_id = decode_idx
+                decode_idx += 1
+
+            lo = bisect.bisect_left(gpu_ts, ts)
+            hi = bisect.bisect_right(gpu_ts, end)
+            span_kernels = [gpu_events_sorted[i] for i in range(lo, hi)
+                            if gpu_events_sorted[i].get("ts", 0) + gpu_events_sorted[i].get("dur", 0) <= end]
+
+            if not span_kernels:
+                continue
+
+            root_name = f"{root_type}_{root_id}"
+            root = ModuleNode(
+                name=root_name,
+                module_type=root_type,
+                instance_id=root_id,
+                ts=ts, end=end,
+                tid=tid, pid=pid,
+            )
+            root._phase = phase
+
+            kernel_names = [k.get("name", "") for k in span_kernels]
+            layer_bounds = graph_correlator._detect_layers(kernel_names)
+
+            for layer_i, (start, end_idx, label) in enumerate(layer_bounds):
+                layer_name = f"Layer_{layer_i}"
+                layer_kernels = span_kernels[start:end_idx]
+                if not layer_kernels:
+                    continue
+                layer_node = ModuleNode(
+                    name=layer_name,
+                    module_type="Layer",
+                    instance_id=layer_i,
+                    ts=layer_kernels[0].get("ts", 0),
+                    end=layer_kernels[-1].get("ts", 0) + layer_kernels[-1].get("dur", 0),
+                    tid=tid, pid=pid,
+                )
+                layer_node._phase = phase
+                layer_node.kernels = layer_kernels
+                total_matched += len(layer_kernels)
+                root.children.append(layer_node)
+
+            roots.append(root)
+
+        print(f"  Built {len(roots)} iteration roots "
+              f"({prefill_idx} prefill, {decode_idx} decode)")
+        print(f"  Matched {total_matched:,} / {len(all_gpu_events):,} GPU events")
+        return roots
 
     def _fallback_kernel_only(self, kernel_events: List[Dict]):
         """Basic kernel-only analysis when no module events are present."""
@@ -2823,6 +3401,198 @@ class TraceModuleAnalyzer:
 
 
 # ---------------------------------------------------------------------------
+# Recategorize existing Excel
+# ---------------------------------------------------------------------------
+
+def recategorize_excel(xlsx_path: str, output_path: Optional[str] = None):
+    """Re-apply kernel_categories.csv to an existing analysis Excel file.
+
+    Updates Category columns and summary tables in-place (or to a new file).
+    No trace file is needed.
+    """
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        print("ERROR: openpyxl not installed. Run: pip install openpyxl",
+              file=sys.stderr)
+        sys.exit(1)
+
+    categories = _load_kernel_categories()
+    if not categories:
+        print("ERROR: kernel_categories.csv not found or empty", file=sys.stderr)
+        sys.exit(1)
+
+    def classify(name: str) -> str:
+        for cat, pat in categories:
+            if pat.search(name):
+                return cat
+        return "other"
+
+    wb = openpyxl.load_workbook(xlsx_path)
+    skip_sheets = {"Summary", "Overview", "Module Tree", "GPU Kernels"}
+    changes = 0
+
+    # --- Detail sheets: update kernel Category (col 6) + category summary ---
+    for sname in wb.sheetnames:
+        if sname in skip_sheets:
+            continue
+        ws = wb[sname]
+        # Find kernel detail header row (has "Kernel Name" in some column)
+        header_row = None
+        name_col = cat_col = dur_col = None
+        for r in range(1, min(ws.max_row + 1, 40)):
+            for c in range(1, ws.max_column + 1):
+                if ws.cell(r, c).value == "Kernel Name":
+                    header_row = r
+                    name_col = c
+                    break
+            if header_row:
+                break
+        if not header_row or not name_col:
+            continue
+        # Find Category and Duration columns
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(header_row, c).value
+            if val == "Category":
+                cat_col = c
+            elif val == "Duration (us)":
+                dur_col = c
+        if not cat_col:
+            continue
+
+        # Update each kernel row
+        cat_dur: Dict[str, float] = defaultdict(float)
+        for r in range(header_row + 1, ws.max_row + 1):
+            kname = ws.cell(r, name_col).value
+            if not kname or "truncated" in str(kname):
+                break
+            old_cat = ws.cell(r, cat_col).value or ""
+            new_cat = classify(str(kname))
+            if old_cat != new_cat:
+                ws.cell(r, cat_col).value = new_cat
+                changes += 1
+            dur = ws.cell(r, dur_col).value if dur_col else 0
+            cat_dur[new_cat] += float(dur or 0)
+
+        # Find and rewrite the category summary table (rows 7+)
+        cat_header_row = None
+        for r in range(1, header_row):
+            if ws.cell(r, 1).value == "Category":
+                cat_header_row = r
+                break
+        if cat_header_row:
+            sorted_cats = sorted(cat_dur.items(), key=lambda x: -x[1])
+            cat_total = sum(cat_dur.values())
+            # Clear old summary rows (between header and kernel detail header)
+            cr = cat_header_row + 1
+            while cr < header_row - 1:
+                for c in range(1, 4):
+                    ws.cell(cr, c).value = None
+                    ws.cell(cr, c).font = Font()
+                cr += 1
+            # Write new summary
+            cr = cat_header_row + 1
+            for cat, dur in sorted_cats:
+                pct = dur / cat_total * 100 if cat_total > 0 else 0
+                ws.cell(cr, 1).value = cat
+                ws.cell(cr, 2).value = f"{pct:.0f}%"
+                ws.cell(cr, 3).value = round(dur, 1)
+                cr += 1
+            ws.cell(cr, 1).value = "Total"
+            ws.cell(cr, 1).font = Font(bold=True)
+            ws.cell(cr, 2).value = "100%"
+            ws.cell(cr, 2).font = Font(bold=True)
+            ws.cell(cr, 3).value = round(cat_total, 1)
+            ws.cell(cr, 3).font = Font(bold=True)
+
+        print(f"  {sname}: {len(cat_dur)} categories, "
+              f"{sum(1 for _ in range(header_row+1, ws.max_row+1) if ws.cell(_, name_col).value and 'truncated' not in str(ws.cell(_, name_col).value or ''))} kernels")
+
+    # --- GPU Kernels sheet: update Category (col 2) ---
+    if "GPU Kernels" in wb.sheetnames:
+        ws_gk = wb["GPU Kernels"]
+        gk_changes = 0
+        for r in range(2, ws_gk.max_row + 1):
+            kname = ws_gk.cell(r, 1).value
+            if not kname:
+                break
+            old_cat = ws_gk.cell(r, 2).value or ""
+            new_cat = classify(str(kname))
+            if old_cat != new_cat:
+                ws_gk.cell(r, 2).value = new_cat
+                gk_changes += 1
+        if gk_changes:
+            print(f"  GPU Kernels: {gk_changes} categories updated")
+
+    # --- Summary sheet: update category breakdown table ---
+    if "Summary" in wb.sheetnames:
+        ws_sum = wb["Summary"]
+        # Find "Category" header row
+        cat_row = None
+        for r in range(1, ws_sum.max_row + 1):
+            if ws_sum.cell(r, 1).value == "Category":
+                cat_row = r
+                break
+        if cat_row:
+            # Re-aggregate from GPU Kernels sheet (most accurate global source)
+            global_cat: Dict[str, Tuple[int, float]] = defaultdict(
+                lambda: (0, 0.0))
+            if "GPU Kernels" in wb.sheetnames:
+                ws_gk = wb["GPU Kernels"]
+                for r in range(2, ws_gk.max_row + 1):
+                    kname = ws_gk.cell(r, 1).value
+                    if not kname:
+                        break
+                    cat = ws_gk.cell(r, 2).value or "other"
+                    count = ws_gk.cell(r, 4).value or 0
+                    dur = ws_gk.cell(r, 3).value or 0
+                    prev = global_cat[cat]
+                    global_cat[cat] = (prev[0] + int(count),
+                                       prev[1] + float(dur))
+            sorted_global = sorted(global_cat.items(), key=lambda x: -x[1][1])
+            # Clear old rows after category header
+            cr = cat_row + 1
+            while cr <= ws_sum.max_row:
+                v = ws_sum.cell(cr, 1).value
+                if v is None or v == "":
+                    break
+                for c in range(1, 5):
+                    ws_sum.cell(cr, c).value = None
+                cr += 1
+            # Write new category rows
+            cr = cat_row + 1
+            for cat, (count, dur) in sorted_global:
+                ws_sum.cell(cr, 1).value = cat
+                ws_sum.cell(cr, 2).value = count
+                ws_sum.cell(cr, 3).value = round(dur, 1)
+                cr += 1
+            print(f"  Summary: {len(sorted_global)} categories updated")
+
+    # --- Module Tree sheet: update Breakdown strings (col 4) ---
+    if "Module Tree" in wb.sheetnames:
+        ws_tree = wb["Module Tree"]
+        tree_changes = 0
+        for r in range(2, ws_tree.max_row + 1):
+            bd = ws_tree.cell(r, 4).value
+            if not bd or not isinstance(bd, str):
+                continue
+            # Breakdown format: "cat: dur us (pct%), cat: dur us (pct%), ..."
+            # We can't fully recompute this without the original kernel data,
+            # so skip Module Tree recategorization (it requires re-running
+            # the full trace analysis).
+            pass
+
+    save_path = output_path or xlsx_path
+    wb.save(save_path)
+    print(f"\nRecategorized Excel saved to: {save_path}")
+    if changes:
+        print(f"  {changes} kernel category assignments changed in detail sheets")
+    else:
+        print("  No category changes detected (Excel already up-to-date)")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2847,11 +3617,24 @@ Examples:
   # Generate interactive module tree HTML and serve it (auto-generates xlsx if no -o)
   python trace_module_analyzer.py trace.json.gz --model-info
   python trace_module_analyzer.py trace.json.gz -o report.xlsx --model-info --port 9000
+
+  # Restrict to a specific forward pass (ATOM traces with multiple passes)
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --phase-index Prefill_0
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --phase-index Prefill_0 --detail-instance 16 17 18 19
+  python trace_module_analyzer.py trace.json.gz -o report.xlsx --phase-index 0  # keeps Prefill_0 + Decode_0
+
+  # Re-apply kernel_categories.csv to existing Excel(s) (no trace needed)
+  python trace_module_analyzer.py --recategorize report.xlsx
+  python trace_module_analyzer.py --recategorize b200.xlsx mi355.xlsx
 """,
     )
-    parser.add_argument("trace_file", help="Path to trace file (.json.gz or .json)")
+    parser.add_argument("trace_file", nargs="?", default=None,
+                        help="Path to trace file (.json.gz or .json)")
     parser.add_argument("-o", "--output", dest="output", default=None,
                         help="Output Excel report path (.xlsx)")
+    parser.add_argument("--recategorize", nargs="+", metavar="XLSX",
+                        help="Re-apply kernel_categories.csv to one or more existing "
+                             "Excel files (no trace file needed)")
     parser.add_argument("--max-detail-modules", type=int, default=3,
                         help="Number of module types to generate detail sheets for "
                              "(default: 3, 0=all)")
@@ -2861,11 +3644,19 @@ Examples:
     parser.add_argument("--module-index", type=int, default=None,
                         help="Which occurrence of the module to show detail for "
                              "(default: the instance closest to the median)")
+    parser.add_argument("--detail-instance", nargs="+", type=int, default=None,
+                        help="Instance IDs for Excel detail sheets "
+                             "(e.g. --detail-instance 59 60 61 62)")
     parser.add_argument("--model-info", action="store_true",
                         help="Generate interactive module tree HTML visualization "
                              "and start HTTP server (requires visualize_module_tree.py)")
     parser.add_argument("--port", type=int, default=8765,
                         help="HTTP server port for --model-info (default: 8765)")
+    parser.add_argument("--phase-index", default=None,
+                        help="Restrict analysis to a specific forward pass. "
+                             "Use a name like Prefill_0 or Decode_2 for a single root, "
+                             "or an integer like 0 to keep all roots with that index "
+                             "(e.g. Prefill_0 + Decode_0)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -2878,11 +3669,28 @@ Examples:
         format="%(levelname)s: %(message)s",
     )
 
+    # --recategorize: update categories in existing Excel, no trace needed
+    if args.recategorize:
+        for xlsx in args.recategorize:
+            print(f"Recategorizing: {xlsx}")
+            recategorize_excel(xlsx)
+        return
+
+    if not args.trace_file:
+        parser.error("trace_file is required (unless using --recategorize)")
+
     # Resolve output path: if relative, save to same folder as trace file
     output_path = args.output
     if output_path and not os.path.isabs(output_path):
         trace_dir = os.path.dirname(os.path.abspath(args.trace_file))
         output_path = os.path.join(trace_dir, output_path)
+
+    phase_index = args.phase_index
+    if phase_index is not None:
+        try:
+            phase_index = int(phase_index)
+        except ValueError:
+            pass
 
     try:
         analyzer = TraceModuleAnalyzer(
@@ -2890,6 +3698,8 @@ Examples:
             output_path=output_path,
             detail_modules=args.detail_module,
             module_index=args.module_index,
+            detail_instances=args.detail_instance,
+            phase_index=phase_index,
             max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,
