@@ -135,6 +135,8 @@ class ModuleStats:
     kernel_details: List[KernelDetail] = field(default_factory=list)  # all kernels/ops in time order
     children_stats: List["ModuleStats"] = field(default_factory=list)
     phase: str = ""  # "prefill" / "decode" / ""
+    # Ancestor path from nn.Module root to this node's parent ("" at roots).
+    parent_tree_path: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -1092,6 +1094,7 @@ class ModuleAggregator:
             instance_id=node.instance_id,
             depth=depth,
         )
+        stats.parent_tree_path = parent_path
 
         # Direct kernel stats
         for k in node.kernels:
@@ -1367,7 +1370,8 @@ class ReportGenerator:
 
     def print_type_summary(self, stats_list: List[ModuleStats], mode: str,
                            max_detail_modules: int = 3,
-                           detail_modules: Optional[List[str]] = None):
+                           detail_modules: Optional[List[str]] = None,
+                           stable_detail_sheet_names: bool = False):
         """Print summary matching the Summary tab: metrics, categories, detail tabs."""
         grand_total = sum(
             (s.total_kernel_time if mode == "full" else s.total_cpu_op_time)
@@ -1416,7 +1420,9 @@ class ReportGenerator:
             for i, (vlabel, _sig, vtime, vcount) in enumerate(variants):
                 connector = "└── " if i == total_rows - 1 else "├── "
                 vpct = vtime / grand_total * 100 if grand_total > 0 else 0
-                tab = self._format_detail_sheet_name(mtype, phase_used, vlabel)
+                tab = self._format_detail_sheet_name(
+                    mtype, phase_used, vlabel,
+                    stable_detail_sheet_names=stable_detail_sheet_names)
                 label = f"{parent_indent}    {connector}({vlabel}) {vcount}x"
                 print(f"  {label:<45s} {vtime:>14,.1f} {vpct:>6.1f}%  {tab}")
             if show_other:
@@ -1452,10 +1458,12 @@ class ReportGenerator:
                 root_info, root_phase_used = _lookup_variants(rtype, root_phase)
                 if root_info:
                     root_tab = self._format_detail_sheet_name(
-                        rtype, root_phase_used, root_info["variants"][0][0])
+                        rtype, root_phase_used, root_info["variants"][0][0],
+                        stable_detail_sheet_names=stable_detail_sheet_names)
                 else:
                     root_tab = self._format_detail_sheet_name(
-                        rtype, root_phase, "")
+                        rtype, root_phase, "",
+                        stable_detail_sheet_names=stable_detail_sheet_names)
             print(f"  {rtype:<45s} {rtype_total:>14,.1f} {pct:>6.1f}%  {root_tab}")
             if len(chain) == 1:
                 _print_variant_rows("", rtype, root_phase)
@@ -1475,10 +1483,12 @@ class ReportGenerator:
                         ctype, root_phase)
                     if child_info:
                         tab = self._format_detail_sheet_name(
-                            ctype, child_phase_used, child_info["variants"][0][0])
+                            ctype, child_phase_used, child_info["variants"][0][0],
+                            stable_detail_sheet_names=stable_detail_sheet_names)
                     else:
                         tab = self._format_detail_sheet_name(
-                            ctype, root_phase, "")
+                            ctype, root_phase, "",
+                            stable_detail_sheet_names=stable_detail_sheet_names)
                 print(f"  {label:<45s} {ct:>14,.1f} {ct_pct:>6.1f}%  {tab}")
                 _print_variant_rows("    ", ctype, root_phase)
 
@@ -1596,6 +1606,7 @@ class ReportGenerator:
                      output_path: str, max_detail_modules: int = 3,
                      detail_modules: Optional[List[str]] = None,
                      detail_instances: Optional[List[int]] = None,
+                     stable_detail_sheet_names: bool = False,
 ):
         """Export analysis to Excel workbook."""
         try:
@@ -1608,6 +1619,26 @@ class ReportGenerator:
             return
 
         self.max_detail_modules = max_detail_modules
+
+        if detail_instances and detail_modules:
+            _dmods = list(detail_modules)
+            if len(_dmods) > 1 and len(_dmods) != len(detail_instances):
+                msg = (
+                    "With more than one --detail-module name, --detail-instance "
+                    "must list the same number of integers (one per tab, in order). "
+                    "Example: --detail-module Qwen3_5LinearDecoderLayer "
+                    "Qwen3_5AttentionDecoderLayer Qwen3_5AttentionDecoderLayer "
+                    "--detail-instance 1 3 4. "
+                    "For one module type with several instances, use a single "
+                    "--detail-module: --detail-module Qwen3_5AttentionDecoderLayer "
+                    "--detail-instance 1 3 4 5. "
+                    "Repeat a module name on --detail-module to open multiple tabs "
+                    "for that type (paired with matching --detail-instance lengths)."
+                )
+                logger.error(msg)
+                print(f"ERROR: {msg}", file=sys.stderr)
+                return
+
         wb = Workbook()
         header_font = Font(bold=True)
         header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
@@ -1626,8 +1657,10 @@ class ReportGenerator:
 
         # Pre-compute detail tab selection (needed by Summary tab and detail sheets)
         if detail_modules:
-            top_type_names = set(detail_modules)
+            detail_module_order = list(detail_modules)
+            top_type_names = set(detail_module_order)
         else:
+            detail_module_order = None
             top_type_names, _, _, _, _ = \
                 self._select_max_detail_modules(stats_list, mode, max_detail_modules)
 
@@ -1637,14 +1670,9 @@ class ReportGenerator:
         variant_labels, variant_aggregates = self._compute_variant_aggregates(
             stats_list, mode)
 
-        # --- Summary tab (one-pager overview) ---
+        # --- Summary tab (written after detail_sheet_names is built) ---
         ws_summary = wb.active
         ws_summary.title = "Summary"
-        summary_last_row = self._write_summary_tab(
-            ws_summary, stats_list, mode, grand_total,
-            total_kernel_count, global_cat_agg,
-            header_font, header_fill, title_font,
-            top_type_names, variant_aggregates)
 
         # --- Overview sheet (hierarchical type tree, with % of Parent + stats) ---
         ws_ov = wb.create_sheet(title="Overview")
@@ -1728,11 +1756,13 @@ class ReportGenerator:
             cell.fill = header_fill
         tree_row = 2
         seen_tree_roots: set = set()
+        tree_root_stats: List[ModuleStats] = []
         for s in stats_list:
             key = (s.module_type, s.instance_id)
             if key in seen_tree_roots:
                 continue
             seen_tree_roots.add(key)
+            tree_root_stats.append(s)
             tree_row = self._write_tree_rows(ws_tree, s, mode, tree_row, 0)
         ws_tree.column_dimensions["A"].width = 50
         ws_tree.column_dimensions["D"].width = 60
@@ -1791,32 +1821,108 @@ class ReportGenerator:
         instance_detail_list: List[Tuple[ModuleStats, str]] = []
         if detail_instances:
             all_by_type_for_inst: Dict[str, List[ModuleStats]] = defaultdict(list)
-            self._collect_instances_by_type(stats_list, all_by_type_for_inst)
-            requested = set(detail_instances)
-            for mtype in top_type_names:
-                matches = [s for s in all_by_type_for_inst.get(mtype, [])
-                           if s.instance_id in requested]
-                if matches:
-                    instance_override_types.add(mtype)
-                    best_per_id: Dict[int, ModuleStats] = {}
-                    for s in matches:
-                        prev = best_per_id.get(s.instance_id)
-                        if prev is None:
-                            best_per_id[s.instance_id] = s
-                        else:
-                            s_time = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
-                            prev_time = prev.total_kernel_time if mode == "full" else prev.total_cpu_op_time
-                            if s_time > prev_time:
+            self._collect_instances_by_type(tree_root_stats, all_by_type_for_inst)
+            inst_ids = list(detail_instances)
+            used_sheet_titles: set = set()
+
+            def _append_instance_sheet(s: ModuleStats) -> None:
+                phase = getattr(s, "phase", "")
+                if stable_detail_sheet_names:
+                    base = f"{s.name}"
+                else:
+                    phase_suffix = f" ({phase[:3]})" if phase else ""
+                    base = f"{s.name}{phase_suffix}"
+                sname = self._ensure_unique_excel_sheet_name(base[:31], used_sheet_titles)
+                instance_detail_list.append((s, sname))
+
+            if detail_module_order is not None:
+                instance_override_types = set(detail_module_order)
+                n_m, n_i = len(detail_module_order), len(inst_ids)
+                if n_m == n_i:
+                    occ: Dict[Tuple[str, int], int] = defaultdict(int)
+                    for mtype, iid in zip(detail_module_order, inst_ids):
+                        cands = [s for s in all_by_type_for_inst.get(mtype, [])
+                                 if s.instance_id == iid]
+                        if not cands:
+                            print(f"  WARNING: no module {mtype!r} instance_id={iid} "
+                                  f"(skipped tab)")
+                            continue
+                        k = occ[(mtype, iid)]
+                        occ[(mtype, iid)] += 1
+                        if k >= len(cands):
+                            print(f"  WARNING: only {len(cands)} occurrence(s) of "
+                                  f"{mtype!r} instance_id={iid}; reusing last")
+                        s = cands[min(k, len(cands) - 1)]
+                        _append_instance_sheet(s)
+                else:
+                    mtype = detail_module_order[0]
+                    requested = set(inst_ids)
+                    matches = [s for s in all_by_type_for_inst.get(mtype, [])
+                               if s.instance_id in requested]
+                    if matches:
+                        best_per_id: Dict[int, ModuleStats] = {}
+                        for s in matches:
+                            prev = best_per_id.get(s.instance_id)
+                            if prev is None:
                                 best_per_id[s.instance_id] = s
-                    for iid in sorted(best_per_id):
-                        s = best_per_id[iid]
-                        phase = getattr(s, "phase", "")
-                        phase_suffix = f" ({phase[:3]})" if phase else ""
-                        sname = f"{s.name}{phase_suffix}"[:31]
-                        instance_detail_list.append((s, sname))
-            not_found = requested - {s.instance_id for s, _ in instance_detail_list}
-            if not_found:
-                print(f"  WARNING: instance IDs not found: {sorted(not_found)}")
+                            else:
+                                st = (s.total_kernel_time if mode == "full"
+                                      else s.total_cpu_op_time)
+                                pt = (prev.total_kernel_time if mode == "full"
+                                      else prev.total_cpu_op_time)
+                                if st > pt:
+                                    best_per_id[s.instance_id] = s
+                        for iid in inst_ids:
+                            s = best_per_id.get(iid)
+                            if s is not None:
+                                _append_instance_sheet(s)
+                            else:
+                                print(f"  WARNING: instance ID {iid} not found for "
+                                      f"{mtype!r}")
+            else:
+                requested = set(inst_ids)
+                for mtype in top_type_names:
+                    matches = [s for s in all_by_type_for_inst.get(mtype, [])
+                               if s.instance_id in requested]
+                    if matches:
+                        instance_override_types.add(mtype)
+                        best_per_id: Dict[int, ModuleStats] = {}
+                        for s in matches:
+                            prev = best_per_id.get(s.instance_id)
+                            if prev is None:
+                                best_per_id[s.instance_id] = s
+                            else:
+                                s_time = (s.total_kernel_time if mode == "full"
+                                          else s.total_cpu_op_time)
+                                prev_time = (prev.total_kernel_time if mode == "full"
+                                             else prev.total_cpu_op_time)
+                                if s_time > prev_time:
+                                    best_per_id[s.instance_id] = s
+                        for iid in sorted(best_per_id):
+                            s = best_per_id[iid]
+                            _append_instance_sheet(s)
+                not_found = requested - {s.instance_id for s, _ in instance_detail_list}
+                if not_found:
+                    print(f"  WARNING: instance IDs not found: {sorted(not_found)}")
+
+        # Build detail_sheet_names lookup: (mtype, phase, vlabel) -> sheet name
+        # with instance_id embedded so tab names match the Module Tree.
+        detail_sheet_names: Dict[Tuple[str, str, str], str] = {}
+        for (mtype, phase, sig), rep_stats in seen_types.items():
+            vlabel = variant_labels.get((mtype, phase, sig), "")
+            sname = self._format_detail_sheet_name(
+                mtype, phase, vlabel, instance_id=rep_stats.instance_id,
+                stable_detail_sheet_names=stable_detail_sheet_names)
+            detail_sheet_names[(mtype, phase, vlabel)] = sname
+
+        # Now write the Summary tab (deferred so detail_sheet_names is available)
+        summary_last_row = self._write_summary_tab(
+            ws_summary, stats_list, mode, grand_total,
+            total_kernel_count, global_cat_agg,
+            header_font, header_fill, title_font,
+            top_type_names, variant_aggregates,
+            detail_sheet_names=detail_sheet_names,
+            stable_detail_sheet_names=stable_detail_sheet_names)
 
         # Sort detail tabs by total kernel time descending (highest % first)
         sorted_detail_items = sorted(
@@ -1838,7 +1944,12 @@ class ReportGenerator:
                               if s is rep_stats][0]
             else:
                 vlabel = variant_labels.get((mtype, phase, sig), "")
-                sheet_name = self._format_detail_sheet_name(mtype, phase, vlabel)
+                sheet_name = detail_sheet_names.get(
+                    (mtype, phase, vlabel),
+                    self._format_detail_sheet_name(
+                        mtype, phase, vlabel,
+                        instance_id=rep_stats.instance_id,
+                        stable_detail_sheet_names=stable_detail_sheet_names))
             ws_det = wb.create_sheet(title=sheet_name)
             all_details = self._collect_all_details(rep_stats)
             all_details.sort(key=lambda d: d.ts)
@@ -1852,10 +1963,15 @@ class ReportGenerator:
             else:
                 wall_time = 0
 
-            # Row 1: title
+            # Row 1: module / kernel count / parent path (Module Tree alignment)
             phase_label = f" [{phase}]" if phase else ""
+            parent_path = getattr(rep_stats, "parent_tree_path", "") or ""
             ws_det.cell(row=1, column=1,
-                        value=f"{rep_stats.name}{phase_label} — {len(all_details)} kernels").font = Font(bold=True, size=12)
+                        value=f"{rep_stats.name}{phase_label}").font = Font(
+                            bold=True, size=12)
+            ws_det.cell(row=1, column=2, value=len(all_details)).font = Font(
+                bold=True, size=12)
+            ws_det.cell(row=1, column=3, value=parent_path if parent_path else "(root)")
             ws_det.cell(row=2, column=1,
                         value=f"Kernel sum: {sum_dur:,.0f} us  |  "
                               f"Wall time: {wall_time:,.0f} us  |  "
@@ -1992,7 +2108,9 @@ class ReportGenerator:
                            global_cat_agg: Dict[str, List],
                            header_font, header_fill, title_font,
                            top_type_names: set,
-                           variant_aggregates: Optional[Dict] = None):
+                           variant_aggregates: Optional[Dict] = None,
+                           detail_sheet_names: Optional[Dict] = None,
+                           stable_detail_sheet_names: bool = False):
         """Write the Summary tab: kernel time summary with detail tabs, category breakdown.
 
         When a (module_type, phase) group has multiple A/B/C structural
@@ -2003,6 +2121,13 @@ class ReportGenerator:
         from openpyxl.styles import Font, PatternFill
 
         variant_aggregates = variant_aggregates or {}
+        _dsn = detail_sheet_names or {}
+
+        def _detail_name(mtype, phase, vlabel):
+            return _dsn.get((mtype, phase, vlabel),
+                            self._format_detail_sheet_name(
+                                mtype, phase, vlabel,
+                                stable_detail_sheet_names=stable_detail_sheet_names))
 
         # Build wrapper chains
         root_chains: Dict[str, List[str]] = {}
@@ -2063,8 +2188,7 @@ class ReportGenerator:
                 is_last = (i == total_rows - 1)
                 connector = "└── " if is_last else "├── "
                 vpct = vtime / grand_total * 100 if grand_total > 0 else 0
-                detail_ref = self._format_detail_sheet_name(
-                    mtype, phase_used, label)
+                detail_ref = _detail_name(mtype, phase_used, label)
                 ws.cell(row=row, column=1,
                         value=f"{child_indent}{connector}({label}) {vcount}x")
                 ws.cell(row=row, column=2, value=round(vtime, 1))
@@ -2128,11 +2252,11 @@ class ReportGenerator:
                 if root_info:
                     first_label = root_info["variants"][0][0]
                     ws.cell(row=row, column=4,
-                            value=self._format_detail_sheet_name(
+                            value=_detail_name(
                                 rtype, root_phase_used, first_label))
                 else:
                     ws.cell(row=row, column=4,
-                            value=self._format_detail_sheet_name(
+                            value=_detail_name(
                                 rtype, root_phase, ""))
             row += 1
             # Expand variants for root types with no chain (e.g. extend
@@ -2158,10 +2282,10 @@ class ReportGenerator:
                             ctype, root_phase)
                         if child_info:
                             first_label = child_info["variants"][0][0]
-                            detail_ref = self._format_detail_sheet_name(
+                            detail_ref = _detail_name(
                                 ctype, child_phase_used, first_label)
                         else:
-                            detail_ref = self._format_detail_sheet_name(
+                            detail_ref = _detail_name(
                                 ctype, root_phase, "")
                         ws.cell(row=row, column=4, value=detail_ref)
                         for c in range(1, 5):
@@ -2749,21 +2873,48 @@ class ReportGenerator:
         return labels, aggregates
 
     @staticmethod
-    def _format_detail_sheet_name(mtype: str, phase: str, vlabel: str) -> str:
+    def _ensure_unique_excel_sheet_name(desired_base: str, used: set) -> str:
+        """Excel sheet names are max 31 chars and must be unique in *used*."""
+        base = desired_base[:31]
+        if base not in used:
+            used.add(base)
+            return base
+        for k in range(2, 10000):
+            suffix = f"~{k}"
+            cand = (desired_base[: 31 - len(suffix)] + suffix)[:31]
+            if cand not in used:
+                used.add(cand)
+                return cand
+        fallback = f"tab{len(used)}"
+        used.add(fallback)
+        return fallback[:31]
+
+    @staticmethod
+    def _format_detail_sheet_name(mtype: str, phase: str, vlabel: str,
+                                   instance_id: Optional[int] = None,
+                                   stable_detail_sheet_names: bool = False) -> str:
         """Build the per-(type, phase, variant) detail-sheet name.
 
         Excel limits sheet names to 31 chars; we truncate `mtype` to leave
-        room for the " (pre)" / " (dec,A)" suffix.
+        room for the "#N" instance tag and " (pre)" / " (dec,A)" suffix.
+
+        When ``stable_detail_sheet_names`` is True, phase is omitted from the
+        suffix so cross-machine traces (different phase tagging) still produce
+        the same tab titles; structural variant labels (A/B/C) are kept when
+        present to avoid collisions between variant detail sheets.
         """
         suffixes = []
-        if phase:
+        if phase and not stable_detail_sheet_names:
             suffixes.append(phase[:3])
         if vlabel:
             suffixes.append(vlabel)
+        id_tag = f"#{instance_id}" if instance_id is not None else ""
         if suffixes:
             suffix = f" ({','.join(suffixes)})"
-            return f"{mtype[:28 - len(suffix)]}{suffix}"
-        return mtype[:28]
+            budget = 31 - len(suffix) - len(id_tag)
+            return f"{mtype[:budget]}{id_tag}{suffix}"
+        budget = 31 - len(id_tag)
+        return f"{mtype[:budget]}{id_tag}"
 
     def _write_kernel_name_breakdown(self, ws, stats_list: List[ModuleStats],
                                      mode: str, row: int,
@@ -2822,7 +2973,8 @@ class TraceModuleAnalyzer:
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
-                 port: int = 8765):
+                 port: int = 8765,
+                 stable_detail_sheet_names: bool = False):
         self.trace_path = trace_path
         self.output_path = output_path
         self.detail_modules = detail_modules or []
@@ -2833,6 +2985,7 @@ class TraceModuleAnalyzer:
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
         self.port = port
+        self.stable_detail_sheet_names = stable_detail_sheet_names
 
     def run(self):
         import time as _time
@@ -2949,9 +3102,11 @@ class TraceModuleAnalyzer:
 
                     print(f"  {_elapsed()} aggregation done")
                     reporter = ReportGenerator()
-                    reporter.print_type_summary(stats_list, mode,
-                                                max_detail_modules=self.max_detail_modules,
-                                                detail_modules=self.detail_modules)
+                    reporter.print_type_summary(
+                        stats_list, mode,
+                        max_detail_modules=self.max_detail_modules,
+                        detail_modules=self.detail_modules,
+                        stable_detail_sheet_names=self.stable_detail_sheet_names)
                     for dm in self.detail_modules:
                         reporter.print_layer_detail(stats_list, mode, dm,
                                                     self.module_index)
@@ -2959,10 +3114,12 @@ class TraceModuleAnalyzer:
 
                     xlsx_path = self.output_path
                     if xlsx_path:
-                        reporter.export_excel(stats_list, mode, xlsx_path,
-                                              max_detail_modules=self.max_detail_modules,
-                                              detail_modules=self.detail_modules,
-                                              detail_instances=self.detail_instances)
+                        reporter.export_excel(
+                            stats_list, mode, xlsx_path,
+                            max_detail_modules=self.max_detail_modules,
+                            detail_modules=self.detail_modules,
+                            detail_instances=self.detail_instances,
+                            stable_detail_sheet_names=self.stable_detail_sheet_names)
                         print(f"  {_elapsed()} excel export done")
                     return
             print("\nWARNING: No nn.Module events found. Trace may not have been captured "
@@ -3048,9 +3205,11 @@ class TraceModuleAnalyzer:
         print(f"  {_elapsed()} aggregation done")
         # Step 6: Output
         reporter = ReportGenerator()
-        reporter.print_type_summary(stats_list, mode,
-                                    max_detail_modules=self.max_detail_modules,
-                                    detail_modules=self.detail_modules)
+        reporter.print_type_summary(
+            stats_list, mode,
+            max_detail_modules=self.max_detail_modules,
+            detail_modules=self.detail_modules,
+            stable_detail_sheet_names=self.stable_detail_sheet_names)
 
         for dm in self.detail_modules:
             reporter.print_layer_detail(stats_list, mode, dm,
@@ -3071,10 +3230,12 @@ class TraceModuleAnalyzer:
             tmp_xlsx = xlsx_path
 
         if xlsx_path:
-            reporter.export_excel(stats_list, mode, xlsx_path,
-                                  max_detail_modules=self.max_detail_modules,
-                                  detail_modules=self.detail_modules,
-                                  detail_instances=self.detail_instances)
+            reporter.export_excel(
+                stats_list, mode, xlsx_path,
+                max_detail_modules=self.max_detail_modules,
+                detail_modules=self.detail_modules,
+                detail_instances=self.detail_instances,
+                stable_detail_sheet_names=self.stable_detail_sheet_names)
             print(f"  {_elapsed()} excel export done")
 
         if self.model_info and xlsx_path:
@@ -3505,14 +3666,18 @@ Examples:
                         help="Number of module types to generate detail sheets for "
                              "(default: 3, 0=all)")
     parser.add_argument("--detail-module", nargs="+", default=None,
-                        help="Specify module types for kernel-by-kernel detail "
-                             "(e.g. --detail-module WanTransformerBlock FSDPT5Block)")
+                        help="Module type(s) for detail sheets, in order; repeat a "
+                             "name for multiple tabs of that type. With "
+                             "--detail-instance: one module name = broadcast "
+                             "instances to that type; several names = same-length "
+                             "instance list zipped in order.")
     parser.add_argument("--module-index", type=int, default=None,
                         help="Which occurrence of the module to show detail for "
                              "(default: the instance closest to the median)")
     parser.add_argument("--detail-instance", nargs="+", type=int, default=None,
-                        help="Instance IDs for Excel detail sheets "
-                             "(e.g. --detail-instance 59 60 61 62)")
+                        help="Instance ID(s): with one --detail-module, each value "
+                             "is one tab; with several --detail-module names, give "
+                             "the same number of integers (paired in order).")
     parser.add_argument("--model-info", action="store_true",
                         help="Generate interactive module tree HTML visualization "
                              "and start HTTP server (requires visualize_module_tree.py)")
@@ -3525,6 +3690,10 @@ Examples:
                              "(e.g. Prefill_0 + Decode_0)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
+    parser.add_argument("--stable-detail-sheet-names", action="store_true",
+                        help="Omit prefill/decode from Excel detail tab names (and from "
+                             "--detail-instance tab titles) so cross-machine comparisons "
+                             "line up; structural variant letters (A/B) are kept when present")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging")
 
@@ -3570,6 +3739,7 @@ Examples:
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,
             port=args.port,
+            stable_detail_sheet_names=args.stable_detail_sheet_names,
         )
         analyzer.run()
     except FileNotFoundError as e:
