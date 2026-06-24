@@ -1309,6 +1309,21 @@ class ReportGenerator:
         else:
             wall_time = 0
 
+        # Compute active_time via sorted interval union; idle = wall - active
+        active_time = 0.0
+        if all_details:
+            srt = sorted(all_details, key=lambda d: d.ts)
+            ms, me = srt[0].ts, srt[0].ts + srt[0].duration
+            for d in srt[1:]:
+                s, e = d.ts, d.ts + d.duration
+                if s <= me:
+                    me = max(me, e)
+                else:
+                    active_time += me - ms
+                    ms, me = s, e
+            active_time += me - ms
+        idle_time = max(0.0, wall_time - active_time)
+
         print(f"\n{'='*100}")
         print(f"  Layer Detail: {selected.name}  [{len(all_details)} items]")
         print(f"  Kernel sum: {sum_dur:,.0f} us  |  Wall time: {wall_time:,.0f} us  "
@@ -1337,6 +1352,9 @@ class ReportGenerator:
                 print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname:50s}  {dims}")
             else:
                 print(f"  {i:4d}  {d.duration:13,.1f}  {pct:5.1f}%  {d.category:>15s}  {leaf:30s}  {kname}")
+        idle_pct = idle_time / wall_time * 100 if wall_time > 0 else 0
+        print(f"  {'':4s}  {idle_time:13,.1f}  {idle_pct:5.1f}%  {'':>15s}  {'':30s}  idle (gap)")
+        print(f"  {'':4s}  {wall_time:13,.1f}  {'':6s}  {'':>15s}  {'':30s}  wall time (span)")
 
     def _pick_median_instance(self, matches: List[ModuleStats],
                               mode: str) -> Tuple[ModuleStats, str]:
@@ -2027,6 +2045,22 @@ class ReportGenerator:
                 cell.font = header_font
                 cell.fill = header_fill
             cur_row += 1
+            # Compute active_time via sorted interval union (all_details already
+            # sorted by ts above).  idle_time = wall_time - active_time.
+            active_time = 0.0
+            if all_details:
+                merge_start = all_details[0].ts
+                merge_end = all_details[0].ts + all_details[0].duration
+                for d in all_details[1:]:
+                    s, e = d.ts, d.ts + d.duration
+                    if s <= merge_end:
+                        merge_end = max(merge_end, e)
+                    else:
+                        active_time += merge_end - merge_start
+                        merge_start, merge_end = s, e
+                active_time += merge_end - merge_start
+            idle_time = max(0.0, wall_time - active_time)
+
             detail_truncated = len(all_details) > MAX_ROWS_PER_TAB
             for i, d in enumerate(all_details[:MAX_ROWS_PER_TAB], 1):
                 pct = d.duration / wall_time * 100 if wall_time > 0 else 0
@@ -2049,6 +2083,19 @@ class ReportGenerator:
             if detail_truncated:
                 ws_det.cell(row=cur_row, column=1,
                             value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+                cur_row += 1
+            # Idle-gap synthetic row
+            idle_pct = idle_time / wall_time * 100 if wall_time > 0 else 0
+            idle_font = Font(italic=True, color="888888")
+            idle_cell_name = ws_det.cell(row=cur_row, column=3, value="idle (gap)")
+            idle_cell_name.font = idle_font
+            ws_det.cell(row=cur_row, column=4, value=round(idle_time, 1)).font = idle_font
+            ws_det.cell(row=cur_row, column=5, value=round(idle_pct, 1)).font = idle_font
+            cur_row += 1
+            # Wall-time-span footer row
+            span_font = Font(bold=True)
+            ws_det.cell(row=cur_row, column=3, value="wall time (span)").font = span_font
+            ws_det.cell(row=cur_row, column=4, value=round(wall_time, 1)).font = span_font
             ws_det.column_dimensions["A"].width = 35
             ws_det.column_dimensions["B"].width = 60
             ws_det.column_dimensions["C"].width = 80
@@ -3416,6 +3463,93 @@ class TraceModuleAnalyzer:
         for cat, (dur, cnt) in sorted(breakdown.items(), key=lambda x: -x[1][0]):
             pct = dur / total_dur * 100 if total_dur > 0 else 0
             print(f"  {cat:<20s} {dur:>14,.0f} {cnt:>8,d} {pct:>6.1f}%")
+
+        # Generate Excel if an output path was requested
+        xlsx_path = self.output_path
+        if not xlsx_path and self.model_info:
+            trace_dir = os.path.dirname(os.path.abspath(self.trace_path))
+            trace_base = os.path.splitext(os.path.basename(self.trace_path))[0]
+            if trace_base.endswith(".json"):
+                trace_base = trace_base[:-5]
+            xlsx_path = os.path.join(trace_dir, f"{trace_base}_analysis.xlsx")
+
+        if xlsx_path:
+            try:
+                from openpyxl import Workbook
+                from openpyxl.styles import Font, PatternFill
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Kernel-Only Summary"
+                header_font = Font(bold=True)
+                header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF",
+                                          fill_type="solid")
+                headers = ["Category", "Duration (us)", "Count", "% of Total"]
+                for col, h in enumerate(headers, 1):
+                    cell = ws.cell(row=1, column=col, value=h)
+                    cell.font = header_font
+                    cell.fill = header_fill
+
+                row = 2
+                for cat, (dur, cnt) in sorted(breakdown.items(), key=lambda x: -x[1][0]):
+                    pct = dur / total_dur * 100 if total_dur > 0 else 0
+                    ws.cell(row=row, column=1, value=cat)
+                    ws.cell(row=row, column=2, value=round(dur, 1))
+                    ws.cell(row=row, column=3, value=cnt)
+                    ws.cell(row=row, column=4, value=round(pct, 2))
+                    row += 1
+
+                # Totals row
+                ws.cell(row=row, column=1, value="TOTAL").font = header_font
+                ws.cell(row=row, column=2, value=round(total_dur, 1)).font = header_font
+                ws.cell(row=row, column=3,
+                        value=len(kernel_events)).font = header_font
+                ws.cell(row=row, column=4, value=100.0).font = header_font
+
+                ws.column_dimensions["A"].width = 24
+
+                # GPU Kernels tab: per-kernel-name aggregation
+                ws_kn = wb.create_sheet(title="GPU Kernels")
+                kn_headers = ["Kernel Name", "Category", "Total Duration (us)",
+                              "Count", "Avg (us)", "% of Total"]
+                for col, h in enumerate(kn_headers, 1):
+                    cell = ws_kn.cell(row=1, column=col, value=h)
+                    cell.font = header_font
+                    cell.fill = header_fill
+
+                kn_agg: Dict[str, List] = {}  # name -> [dur, count, category]
+                for k in kernel_events:
+                    kname = k.get("name", "")
+                    dur = k.get("dur", 0)
+                    cat = _categorize_kernel(kname)
+                    entry = kn_agg.get(kname)
+                    if entry:
+                        entry[0] += dur
+                        entry[1] += 1
+                    else:
+                        kn_agg[kname] = [dur, 1, cat]
+
+                sorted_kn = sorted(kn_agg.items(), key=lambda x: -x[1][0])
+                truncated = len(sorted_kn) > MAX_ROWS_PER_TAB
+                kn_row = 2
+                for kname, (dur, cnt, cat) in sorted_kn[:MAX_ROWS_PER_TAB]:
+                    pct = dur / total_dur * 100 if total_dur > 0 else 0
+                    ws_kn.cell(row=kn_row, column=1, value=kname)
+                    ws_kn.cell(row=kn_row, column=2, value=cat)
+                    ws_kn.cell(row=kn_row, column=3, value=round(dur, 1))
+                    ws_kn.cell(row=kn_row, column=4, value=cnt)
+                    ws_kn.cell(row=kn_row, column=5,
+                               value=round(dur / cnt, 1) if cnt else 0)
+                    ws_kn.cell(row=kn_row, column=6, value=round(pct, 1))
+                    kn_row += 1
+                if truncated:
+                    ws_kn.cell(row=kn_row, column=1,
+                               value=f"... truncated at {MAX_ROWS_PER_TAB} rows")
+                ws_kn.column_dimensions["A"].width = 80
+
+                wb.save(xlsx_path)
+                print(f"\n  Kernel-only Excel report saved to: {xlsx_path}")
+            except ImportError:
+                print("  (openpyxl not installed — skipping Excel export)")
 
     @staticmethod
     def _load_trace(path: str) -> Dict[str, Any]:
