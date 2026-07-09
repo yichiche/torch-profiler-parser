@@ -103,11 +103,12 @@ class KernelDetail:
     of instances for large traces).
     """
     __slots__ = ("name", "duration", "category", "module_path",
-                 "ts", "phase", "input_dims", "source_path")
+                 "ts", "phase", "input_dims", "source_path", "callstack")
 
     def __init__(self, name: str, duration: float, category: str,
                  module_path: str, ts: float = 0.0, phase: str = "",
-                 input_dims: str = "", source_path: str = ""):
+                 input_dims: str = "", source_path: str = "",
+                 callstack: Optional[List[str]] = None):
         self.name = name
         self.duration = duration
         self.category = category
@@ -116,6 +117,7 @@ class KernelDetail:
         self.phase = phase
         self.input_dims = input_dims
         self.source_path = source_path
+        self.callstack: List[str] = callstack if callstack is not None else []
 
 
 @dataclass
@@ -382,6 +384,7 @@ class PythonSourceIndex:
         }
 
         self._corr_to_source: Dict[int, str] = {}
+        self._corr_to_stack: Dict[int, List[str]] = {}
         all_launches = list(runtime_events)
         if driver_events:
             all_launches.extend(driver_events)
@@ -395,9 +398,21 @@ class PythonSourceIndex:
             src = self._find_source(ts, pid, tid)
             if src:
                 self._corr_to_source[corr] = src
+            stack = self._find_callstack(ts, pid, tid)
+            if stack:
+                self._corr_to_stack[corr] = stack
 
     def get_source(self, correlation_id: int) -> str:
         return self._corr_to_source.get(correlation_id, "")
+
+    def get_callstack(self, correlation_id: int) -> List[str]:
+        """Return the full CPU call stack for a kernel, outermost → innermost.
+
+        Collects every python_function frame enclosing the kernel's launch
+        timestamp and returns them sorted widest-span-first (outermost caller
+        first).  Skips pure boilerplate wrappers to keep the stack readable.
+        """
+        return self._corr_to_stack.get(correlation_id, [])
 
     def _find_source(self, ts: float, pid: int, tid: int) -> str:
         """Find the best Python source location enclosing *ts*.
@@ -465,6 +480,42 @@ class PythonSourceIndex:
             return best_fallback
         return ""
 
+    # Trivial boilerplate to strip from call stacks (improves readability).
+    _BOILERPLATE_RE = re.compile(
+        r"threading\.py|multiprocessing/|<string>|tqdm/|importlib/"
+        r"|contextlib\.py|<genexpr>|<lambda>|<module>",
+        re.IGNORECASE,
+    )
+
+    def _find_callstack(self, ts: float, pid: int, tid: int) -> List[str]:
+        """Collect all python_function frames enclosing *ts*, outermost first.
+
+        Returns frames sorted by span descending (widest = outermost caller
+        first).  Boilerplate-only frames are dropped to keep stacks concise.
+        """
+        key = (pid, tid)
+        intervals = self._intervals.get(key)
+        if not intervals:
+            return []
+        starts = self._starts_cache[key]
+        idx = bisect.bisect_right(starts, ts) - 1
+
+        # Collect every enclosing frame with its span for ordering.
+        frames: List[Tuple[float, str]] = []  # (span, name) — wider = earlier
+        lo = max(0, idx - 80)
+        hi = min(len(intervals), idx + 10)
+        for i in range(lo, hi):
+            s, e, name = intervals[i]
+            if s <= ts <= e:
+                if not self._BOILERPLATE_RE.search(name):
+                    frames.append((e - s, name))
+            elif s > ts + 100:
+                break
+
+        # Sort widest-span first so callers appear before callees.
+        frames.sort(key=lambda x: -x[0])
+        return [name for _, name in frames]
+
 
 class KernelCorrelator:
     """Map GPU kernels to modules via correlation ID chain."""
@@ -509,6 +560,7 @@ class KernelCorrelator:
                     k["_input_dims"] = shape_index.get_shape(corr)
                 if source_index is not None:
                     k["_source_path"] = source_index.get_source(corr)
+                    k["_callstack"] = source_index.get_callstack(corr)
                 k["_matched"] = True
                 module.kernels.append(k)
                 matched += 1
@@ -1106,7 +1158,8 @@ class ModuleAggregator:
                 name=kname, duration=dur, category=cat,
                 module_path=path, ts=k.get("ts", 0), phase=node_phase,
                 input_dims=k.get("_input_dims", ""),
-                source_path=k.get("_source_path", "")))
+                source_path=k.get("_source_path", ""),
+                callstack=k.get("_callstack", [])))
 
         # Direct cpu_op stats
         for op in node.cpu_ops:
@@ -2852,6 +2905,182 @@ class ReportGenerator:
                     agg[d.name] = [d.duration, 1, d.category, {s.module_type}]
             self._collect_global_kernel_agg(s.children_stats, agg)
 
+    # ------------------------------------------------------------------
+    # Callstack markdown export
+    # ------------------------------------------------------------------
+
+    def write_callstack_markdown(
+        self,
+        stats_list: List[ModuleStats],
+        md_path: str,
+        mode: str,
+        max_detail_modules: int = 3,
+        detail_modules: Optional[List[str]] = None,
+        detail_instances: Optional[List[int]] = None,
+    ) -> None:
+        """Write a Markdown file with per-kernel CPU→GPU call stacks.
+
+        For every kernel that appears in a "Layer (des)" detail sheet the
+        markdown shows:
+
+        * The module path (nn.Module hierarchy) that owns the kernel
+        * The full Python call stack from the outermost caller down to the
+          kernel launch site
+        * Basic kernel metadata (category, duration, input dims)
+
+        The selection logic for which module instances are covered mirrors
+        ``export_excel`` — the same representative instances used for detail
+        tabs are documented here.
+        """
+        detail_modules = detail_modules or []
+
+        # Collect the representative instances the same way export_excel does.
+        # We reuse _select_detail_instances to get a consistent set.
+        selected = self._select_detail_instances(
+            stats_list, mode,
+            max_detail_modules=max_detail_modules,
+            detail_modules=detail_modules,
+            detail_instances=detail_instances,
+        )
+
+        lines: List[str] = [
+            "# Kernel Call Stacks",
+            "",
+            "Per-kernel CPU → GPU call stacks for each representative module instance.",
+            "Frames are ordered **outermost caller → innermost (kernel launch site)**.",
+            "",
+        ]
+
+        for module_stats, _variant in selected:
+            all_details = self._collect_all_details(module_stats)
+            all_details.sort(key=lambda d: d.ts)
+
+            phase_tag = f" [{module_stats.phase}]" if module_stats.phase else ""
+            lines.append(f"## {module_stats.name}{phase_tag}")
+            lines.append("")
+
+            has_stacks = any(getattr(d, "callstack", []) for d in all_details)
+            if not has_stacks:
+                lines.append("_No call stack data available for this module "
+                             "(CUDA graph replays or cpu_only mode)._")
+                lines.append("")
+                continue
+
+            for i, d in enumerate(all_details, 1):
+                stack = getattr(d, "callstack", [])
+                dims_str = f" | `{d.input_dims}`" if d.input_dims else ""
+                lines.append(
+                    f"### Kernel {i}: `{d.name}`"
+                )
+                lines.append("")
+                lines.append(
+                    f"| Field | Value |"
+                )
+                lines.append("| --- | --- |")
+                lines.append(f"| Module | `{d.module_path}` |")
+                lines.append(f"| Category | {d.category} |")
+                lines.append(f"| Duration | {d.duration:.1f} us |")
+                if d.input_dims:
+                    lines.append(f"| Input Dims | `{d.input_dims}` |")
+                if d.source_path:
+                    lines.append(f"| Launch site | `{d.source_path}` |")
+                lines.append("")
+
+                if stack:
+                    lines.append("**Call stack (CPU → kernel launch):**")
+                    lines.append("")
+                    lines.append("```")
+                    for frame in stack:
+                        lines.append(frame)
+                    lines.append(f"  → [GPU] {d.name}")
+                    lines.append("```")
+                else:
+                    lines.append("_Call stack unavailable for this kernel._")
+                lines.append("")
+
+        with open(md_path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+            fh.write("\n")
+
+        print(f"\n  Call stack markdown saved to: {md_path}")
+
+    def _select_detail_instances(
+        self,
+        stats_list: List[ModuleStats],
+        mode: str,
+        max_detail_modules: int = 3,
+        detail_modules: Optional[List[str]] = None,
+        detail_instances: Optional[List[int]] = None,
+    ) -> List[Tuple["ModuleStats", str]]:
+        """Return (stats, variant_label) pairs matching the detail-tab selection.
+
+        Delegates to the same helper used by export_excel so the markdown
+        covers exactly the same instances as the spreadsheet detail tabs.
+        """
+        detail_modules = detail_modules or []
+        # Reuse the existing export_excel selection helpers.
+        # _find_detail_instances_for_export returns List[(ModuleStats, variant)]
+        return self._find_detail_instances_for_export(
+            stats_list, mode,
+            max_detail_modules=max_detail_modules,
+            detail_modules=detail_modules,
+            detail_instances=detail_instances,
+        )
+
+    def _find_detail_instances_for_export(
+        self,
+        stats_list: List[ModuleStats],
+        mode: str,
+        max_detail_modules: int = 3,
+        detail_modules: Optional[List[str]] = None,
+        detail_instances: Optional[List[int]] = None,
+    ) -> List[Tuple["ModuleStats", str]]:
+        """Shared logic: collect representative (stats, variant) for detail output."""
+        detail_modules = detail_modules or []
+        results: List[Tuple[ModuleStats, str]] = []
+
+        def _add_for_type(type_name: str):
+            all_of_type: List[ModuleStats] = []
+            self._find_modules(stats_list, type_name, all_of_type)
+            if not all_of_type:
+                return
+            if detail_instances:
+                chosen = [m for m in all_of_type if m.instance_id in detail_instances]
+            else:
+                median_inst, _ = self._pick_median_instance(all_of_type, mode)
+                chosen = [median_inst]
+            for m in chosen:
+                results.append((m, ""))
+
+        if detail_modules:
+            for dm in detail_modules:
+                _add_for_type(dm)
+        else:
+            # Mirror the top-N auto-selection from export_excel
+            type_times: Dict[str, float] = {}
+            self._collect_type_times(stats_list, type_times, mode)
+            top_types = sorted(type_times, key=lambda t: -type_times[t])
+            seen = set()
+            for t in top_types:
+                if len(seen) >= max_detail_modules:
+                    break
+                if t in seen:
+                    continue
+                seen.add(t)
+                _add_for_type(t)
+
+        return results
+
+    def _collect_type_times(self, stats_list: List[ModuleStats],
+                            acc: Dict[str, float], mode: str):
+        for s in stats_list:
+            # Use self_kernel_time (kernels directly owned, excluding children)
+            # so container modules like GptOssModel don't outrank the layer
+            # types that actually contain the work.
+            t = s.self_kernel_time if mode == "full" else s.self_cpu_op_time
+            acc[s.module_type] = acc.get(s.module_type, 0.0) + t
+            self._collect_type_times(s.children_stats, acc, mode)
+
 
 # ---------------------------------------------------------------------------
 # Main orchestrator
@@ -2869,7 +3098,8 @@ class TraceModuleAnalyzer:
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
-                 port: int = 8765):
+                 port: int = 8765,
+                 callstack_md: Optional[str] = None):
         self.trace_path = trace_path
         self.output_path = output_path
         self.detail_modules = detail_modules or []
@@ -2880,6 +3110,7 @@ class TraceModuleAnalyzer:
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
         self.port = port
+        self.callstack_md = callstack_md
 
     def run(self):
         import time as _time
@@ -3123,6 +3354,15 @@ class TraceModuleAnalyzer:
                                   detail_modules=self.detail_modules,
                                   detail_instances=self.detail_instances)
             print(f"  {_elapsed()} excel export done")
+
+        if self.callstack_md:
+            reporter.write_callstack_markdown(
+                stats_list, self.callstack_md, mode,
+                max_detail_modules=self.max_detail_modules,
+                detail_modules=self.detail_modules,
+                detail_instances=self.detail_instances,
+            )
+            print(f"  {_elapsed()} callstack markdown done")
 
         if self.model_info and xlsx_path:
             html_path = os.path.splitext(xlsx_path)[0] + "_module_tree.html"
@@ -3659,6 +3899,11 @@ Examples:
                              "(e.g. Prefill_0 + Decode_0)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
+    parser.add_argument("--callstack-md", default=None, metavar="PATH",
+                        help="Write a Markdown file with per-kernel CPU→GPU call stacks "
+                             "for each representative module instance (same instances as "
+                             "the 'Layer (des)' detail sheets in the Excel report). "
+                             "Example: --callstack-md callstacks.md")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Enable debug logging")
 
@@ -3692,6 +3937,12 @@ Examples:
         except ValueError:
             pass
 
+    # Resolve callstack-md path the same way as output
+    callstack_md = args.callstack_md
+    if callstack_md and not os.path.isabs(callstack_md):
+        trace_dir = os.path.dirname(os.path.abspath(args.trace_file))
+        callstack_md = os.path.join(trace_dir, callstack_md)
+
     try:
         analyzer = TraceModuleAnalyzer(
             trace_path=args.trace_file,
@@ -3704,6 +3955,7 @@ Examples:
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,
             port=args.port,
+            callstack_md=callstack_md,
         )
         analyzer.run()
     except FileNotFoundError as e:
