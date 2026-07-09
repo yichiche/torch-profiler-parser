@@ -2906,6 +2906,750 @@ class ReportGenerator:
             self._collect_global_kernel_agg(s.children_stats, agg)
 
     # ------------------------------------------------------------------
+    # Interactive HTML layer report
+    # ------------------------------------------------------------------
+
+    def write_layer_html(
+        self,
+        stats_list: List[ModuleStats],
+        html_path: str,
+        mode: str,
+        max_detail_modules: int = 3,
+        detail_modules: Optional[List[str]] = None,
+        detail_instances: Optional[List[int]] = None,
+    ) -> None:
+        """Write a self-contained interactive HTML report for per-layer kernel analysis.
+
+        For each selected module type, collects ALL instances to compute per-kernel
+        avg / min / max duration across layers.  The page shows:
+          - A kernel timeline bar+error chart (X = kernel slot, Y = avg us, error = min/max)
+          - Drag-and-drop category buckets for re-assigning kernels to categories
+          - A live category bar chart that updates as kernels are reassigned
+        All rendering is done with D3.js loaded from CDN; the page opens offline once cached.
+        """
+        import json as _json
+
+        detail_modules = detail_modules or []
+
+        # --- 1. Collect all instances per selected module type ---
+        type_instances: Dict[str, List[ModuleStats]] = {}
+
+        if detail_modules:
+            for dm in detail_modules:
+                matches: List[ModuleStats] = []
+                self._find_modules(stats_list, dm, matches)
+                if matches:
+                    type_instances[dm] = matches
+        else:
+            type_times: Dict[str, float] = {}
+            self._collect_type_times(stats_list, type_times, mode)
+            top_types = sorted(type_times, key=lambda t: -type_times[t])
+            seen: set = set()
+            for t in top_types:
+                if len(seen) >= max_detail_modules:
+                    break
+                seen.add(t)
+                matches = []
+                self._find_modules(stats_list, t, matches)
+                if matches:
+                    type_instances[t] = matches
+
+        # --- 2. Build per-module-type kernel slot data ---
+        # Align by kernel position within each instance's sorted kernel list.
+        # Instances may have different counts (e.g., prefill vs decode) — we
+        # group by phase first, then align within phase groups.
+
+        def _build_layer_data(instances: List[ModuleStats]) -> List[Dict]:
+            """Return list of kernel slot dicts with avg/min/max across instances."""
+            # Group instances by kernel count (proxy for same structural variant)
+            from collections import defaultdict as _dd
+            groups: Dict[int, List[List]] = _dd(list)
+            for inst in instances:
+                details = self._collect_all_details(inst)
+                details.sort(key=lambda d: d.ts)
+                groups[len(details)].append(details)
+
+            # Pick the largest group (most common kernel count)
+            if not groups:
+                return []
+            canonical_count = max(groups, key=lambda k: len(groups[k]))
+            group = groups[canonical_count]
+
+            slots = []
+            for slot_i in range(canonical_count):
+                durs = [inst_details[slot_i].duration for inst_details in group]
+                sample = group[0][slot_i]
+                slots.append({
+                    "slot": slot_i,
+                    "name": sample.name,
+                    "short_name": (sample.name[:20] + "…") if len(sample.name) > 20 else sample.name,
+                    "category": sample.category,
+                    "module": sample.module_path.split("/")[-1] if sample.module_path else "",
+                    "avg": round(sum(durs) / len(durs), 2),
+                    "min": round(min(durs), 2),
+                    "max": round(max(durs), 2),
+                    "input_dims": sample.input_dims,
+                    "source": sample.source_path,
+                    "instance_count": len(group),
+                })
+            return slots
+
+        layers_data = []
+        for type_name, instances in type_instances.items():
+            slots = _build_layer_data(instances)
+            if not slots:
+                continue
+            # Collect all unique categories present
+            cats = sorted(set(s["category"] for s in slots))
+            layers_data.append({
+                "type_name": type_name,
+                "instance_count": len(instances),
+                "slots": slots,
+                "categories": cats,
+            })
+
+        payload = _json.dumps(layers_data, ensure_ascii=False)
+
+        # --- 3. Render HTML ---
+        html = self._layer_html_template(payload)
+        with open(html_path, "w", encoding="utf-8") as fh:
+            fh.write(html)
+        print(f"\n  Layer HTML report saved to: {html_path}")
+
+    @staticmethod
+    def _layer_html_template(payload_json: str) -> str:
+        return r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kernel Layer Report</title>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<style>
+/* ── design tokens ─────────────────────────────────────── */
+:root {
+  --surface-1:    #fcfcfb;
+  --surface-2:    #f4f4f2;
+  --page-bg:      #f0efec;
+  --text-1:       #0b0b0b;
+  --text-2:       #52514e;
+  --text-muted:   #898781;
+  --grid:         #e1e0d9;
+  --baseline:     #c3c2b7;
+  --border:       rgba(11,11,11,0.12);
+  --radius:       6px;
+  /* categorical slots — fixed order */
+  --c1: #2a78d6; /* blue      */
+  --c2: #1baf7a; /* aqua      */
+  --c3: #eda100; /* yellow    */
+  --c4: #008300; /* green     */
+  --c5: #4a3aa7; /* violet    */
+  --c6: #e34948; /* red       */
+  --c7: #e87ba4; /* magenta   */
+  --c8: #eb6834; /* orange    */
+  --c9: #898781; /* gray (overflow / other) */
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-1: #1a1a19; --surface-2: #242422;
+    --page-bg:   #0d0d0d;
+    --text-1:    #ffffff;  --text-2:    #c3c2b7;
+    --text-muted:#898781;
+    --grid:      #2c2c2a;  --baseline:  #383835;
+    --border:    rgba(255,255,255,0.10);
+    --c1: #3987e5; --c2: #199e70; --c3: #c98500;
+    --c4: #008300; --c5: #9085e9; --c6: #e66767;
+    --c7: #d55181; --c8: #d95926;
+  }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--page-bg);
+  color: var(--text-1);
+  font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+h1 { font-size: 18px; font-weight: 600; }
+h2 { font-size: 15px; font-weight: 600; color: var(--text-2); margin-bottom: 4px; }
+h3 { font-size: 12px; font-weight: 600; text-transform: uppercase;
+     letter-spacing: .06em; color: var(--text-muted); margin-bottom: 8px; }
+
+/* ── layout ────────────────────────────────────────────── */
+#app { max-width: 1400px; margin: 0 auto; padding: 24px 16px; }
+.header { display:flex; align-items:baseline; gap:16px; margin-bottom:24px; }
+.badge { font-size:11px; background:var(--surface-2); border:1px solid var(--border);
+         border-radius:99px; padding:2px 10px; color:var(--text-2); }
+
+.tabs { display:flex; gap:4px; margin-bottom:16px; flex-wrap:wrap; }
+.tab-btn {
+  padding:5px 14px; border-radius:var(--radius); border:1px solid var(--border);
+  background:var(--surface-1); color:var(--text-2); cursor:pointer; font-size:12px;
+  font-family: inherit;
+}
+.tab-btn.active { background:var(--c1); color:#fff; border-color:var(--c1); }
+
+.panel { background:var(--surface-1); border:1px solid var(--border);
+         border-radius:var(--radius); padding:20px; margin-bottom:16px; }
+
+/* ── charts ────────────────────────────────────────────── */
+.chart-row { display:grid; grid-template-columns:1fr 340px; gap:16px; margin-bottom:16px; }
+@media(max-width:900px){ .chart-row { grid-template-columns:1fr; } }
+
+svg text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+.axis path, .axis line { stroke: var(--baseline); }
+.axis text { fill: var(--text-muted); font-size:11px; }
+.grid line { stroke: var(--grid); stroke-dasharray:3,3; }
+.bar-avg { rx:2; cursor:pointer; }
+.errorbar { stroke-width:1.5; pointer-events:none; }
+.errorbar-cap { stroke-width:1.5; pointer-events:none; }
+.bar-cat { rx:2; cursor:pointer; transition: opacity .15s; }
+.bar-cat:hover { opacity:.8; }
+
+/* ── tooltip ───────────────────────────────────────────── */
+#tooltip {
+  position:fixed; pointer-events:none; display:none;
+  background:var(--surface-1); border:1px solid var(--border);
+  border-radius:var(--radius); padding:8px 12px; font-size:12px;
+  box-shadow:0 4px 16px rgba(0,0,0,.12); max-width:320px; z-index:99;
+}
+#tooltip .tt-name { font-weight:600; margin-bottom:4px; word-break:break-all; }
+#tooltip .tt-row { display:flex; justify-content:space-between; gap:16px; color:var(--text-2); }
+#tooltip .tt-val { font-variant-numeric:tabular-nums; color:var(--text-1); }
+
+/* ── buckets / drag-drop ───────────────────────────────── */
+.buckets-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+.bucket {
+  background: var(--surface-2);
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 10px;
+  min-height: 80px;
+  transition: border-color .2s, background .2s;
+}
+.bucket.drag-over {
+  border-color: var(--c1);
+  background: color-mix(in srgb, var(--c1) 8%, var(--surface-2));
+}
+.bucket-header {
+  display: flex; align-items: center; gap:6px;
+  font-size:11px; font-weight:600; text-transform:uppercase;
+  letter-spacing:.05em; margin-bottom:8px; color:var(--text-2);
+}
+.bucket-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+.bucket-chips { display:flex; flex-wrap:wrap; gap:4px; }
+.chip {
+  display:inline-flex; align-items:center; gap:4px;
+  background:var(--surface-1); border:1px solid var(--border);
+  border-radius:4px; padding:2px 7px; font-size:11px;
+  cursor:grab; user-select:none; transition:box-shadow .15s;
+  max-width: 160px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.chip:active { cursor:grabbing; box-shadow:0 2px 8px rgba(0,0,0,.2); }
+.chip-dot { width:7px; height:7px; border-radius:50%; flex-shrink:0; }
+.chip.dragging { opacity:.4; }
+
+/* ── legend ────────────────────────────────────────────── */
+.legend { display:flex; flex-wrap:wrap; gap:8px 16px; margin-bottom:12px; }
+.legend-item { display:flex; align-items:center; gap:5px; font-size:11px; color:var(--text-2); }
+.legend-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+
+/* ── table view ────────────────────────────────────────── */
+details summary { cursor:pointer; font-size:12px; color:var(--text-muted);
+                  margin-top:12px; user-select:none; }
+table { width:100%; border-collapse:collapse; font-size:11px; margin-top:8px; }
+th { text-align:left; padding:4px 8px; border-bottom:1px solid var(--baseline);
+     color:var(--text-muted); font-weight:600; font-variant-numeric:tabular-nums; }
+td { padding:4px 8px; border-bottom:1px solid var(--grid); vertical-align:top;
+     font-variant-numeric:tabular-nums; }
+tr:hover td { background:var(--surface-2); }
+.td-name { max-width:240px; word-break:break-all; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <h1>Kernel Layer Report</h1>
+    <span class="badge" id="global-badge"></span>
+  </div>
+  <div class="tabs" id="type-tabs"></div>
+  <div id="layer-panel"></div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+// ── data ───────────────────────────────────────────────────────────────────
+const LAYERS = """ + payload_json + r""";
+
+// ── color mapping ──────────────────────────────────────────────────────────
+// Build category→color from the palette's fixed categorical slots.
+const CAT_PALETTE_LIGHT = [
+  "#2a78d6","#1baf7a","#eda100","#008300","#4a3aa7","#e34948","#e87ba4","#eb6834","#898781"
+];
+const isDark = window.matchMedia("(prefers-color-scheme:dark)").matches;
+const CAT_PALETTE = isDark
+  ? ["#3987e5","#199e70","#c98500","#008300","#9085e9","#e66767","#d55181","#d95926","#898781"]
+  : CAT_PALETTE_LIGHT;
+
+// Assign colors to categories in fixed order across all layer types.
+const globalCats = [...new Set(LAYERS.flatMap(l => l.categories))].sort();
+const CAT_COLOR = {};
+globalCats.forEach((c, i) => { CAT_COLOR[c] = CAT_PALETTE[i % CAT_PALETTE.length]; });
+
+// ── per-layer mutable state: current category assignments ─────────────────
+// layerState[typeIdx][slotIdx] = currentCategory (string)
+const layerState = LAYERS.map(layer =>
+  layer.slots.map(s => s.category)
+);
+
+// ── helpers ────────────────────────────────────────────────────────────────
+let activeIdx = 0;
+
+function catColor(cat) { return CAT_COLOR[cat] || "#898781"; }
+
+function trunc(s, n=20) {
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function computeCatTotals(typeIdx) {
+  const layer = LAYERS[typeIdx];
+  const state = layerState[typeIdx];
+  const totals = {};
+  layer.slots.forEach((s, i) => {
+    const cat = state[i];
+    totals[cat] = (totals[cat] || 0) + s.avg;
+  });
+  return totals;
+}
+
+// ── tooltip ────────────────────────────────────────────────────────────────
+const tt = document.getElementById("tooltip");
+function showTT(ev, html) {
+  tt.innerHTML = html;
+  tt.style.display = "block";
+  moveTT(ev);
+}
+function moveTT(ev) {
+  const pad = 14, W = tt.offsetWidth, H = tt.offsetHeight;
+  let x = ev.clientX + pad, y = ev.clientY - H / 2;
+  if (x + W > window.innerWidth - 8) x = ev.clientX - W - pad;
+  if (y < 8) y = 8;
+  if (y + H > window.innerHeight - 8) y = window.innerHeight - H - 8;
+  tt.style.left = x + "px";
+  tt.style.top  = y + "px";
+}
+function hideTT() { tt.style.display = "none"; }
+document.addEventListener("mousemove", ev => { if (tt.style.display !== "none") moveTT(ev); });
+
+// ── tabs ───────────────────────────────────────────────────────────────────
+function renderTabs() {
+  const tabBar = document.getElementById("type-tabs");
+  tabBar.innerHTML = "";
+  LAYERS.forEach((layer, i) => {
+    const btn = document.createElement("button");
+    btn.className = "tab-btn" + (i === activeIdx ? " active" : "");
+    btn.textContent = `${layer.type_name} (×${layer.instance_count})`;
+    btn.onclick = () => { activeIdx = i; renderTabs(); renderPanel(); };
+    tabBar.appendChild(btn);
+  });
+  document.getElementById("global-badge").textContent =
+    LAYERS[activeIdx] ? LAYERS[activeIdx].slots.length + " kernels" : "";
+}
+
+// ── main panel ─────────────────────────────────────────────────────────────
+function renderPanel() {
+  const panel = document.getElementById("layer-panel");
+  if (!LAYERS.length) { panel.innerHTML = "<p>No data.</p>"; return; }
+  const layer = LAYERS[activeIdx];
+  panel.innerHTML = "";
+
+  // Chart row: kernel timeline + category bar
+  const chartRow = document.createElement("div");
+  chartRow.className = "chart-row";
+  panel.appendChild(chartRow);
+
+  const timelineWrap = document.createElement("div");
+  timelineWrap.className = "panel";
+  chartRow.appendChild(timelineWrap);
+
+  const catWrap = document.createElement("div");
+  catWrap.className = "panel";
+  chartRow.appendChild(catWrap);
+
+  // Buckets panel
+  const bucketsPanel = document.createElement("div");
+  bucketsPanel.className = "panel";
+  panel.appendChild(bucketsPanel);
+
+  // Table panel
+  const tablePanel = document.createElement("div");
+  tablePanel.className = "panel";
+  panel.appendChild(tablePanel);
+
+  renderTimeline(timelineWrap, layer, activeIdx);
+  renderCatChart(catWrap, layer, activeIdx);
+  renderBuckets(bucketsPanel, layer, activeIdx);
+  renderTable(tablePanel, layer, activeIdx);
+}
+
+// ── kernel timeline chart ──────────────────────────────────────────────────
+function renderTimeline(wrap, layer, typeIdx) {
+  wrap.innerHTML = "";
+  const titleEl = document.createElement("h2");
+  titleEl.textContent = "Kernel Execution Time";
+  wrap.appendChild(titleEl);
+
+  const subEl = document.createElement("p");
+  subEl.style.cssText = "font-size:11px;color:var(--text-muted);margin-bottom:12px";
+  subEl.textContent =
+    `Average across ${layer.instance_count} instances · error bars = min / max`;
+  wrap.appendChild(subEl);
+
+  const slots = layer.slots;
+  const state = layerState[typeIdx];
+
+  const W = wrap.clientWidth - 40 || 600;
+  const H = 260;
+  const margin = { top: 10, right: 16, bottom: 60, left: 58 };
+  const iW = W - margin.left - margin.right;
+  const iH = H - margin.top - margin.bottom;
+
+  const svg = d3.select(wrap).append("svg")
+    .attr("width", W).attr("height", H)
+    .attr("viewBox", `0 0 ${W} ${H}`)
+    .style("overflow", "visible");
+
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+  const xScale = d3.scaleBand()
+    .domain(slots.map((_, i) => i))
+    .range([0, iW]).padding(0.25);
+
+  const maxVal = d3.max(slots, s => s.max) * 1.08;
+  const yScale = d3.scaleLinear().domain([0, maxVal]).range([iH, 0]).nice();
+
+  // Grid
+  g.append("g").attr("class", "grid")
+    .call(d3.axisLeft(yScale).tickSize(-iW).tickFormat(""))
+    .call(gx => gx.select(".domain").remove());
+
+  // Axes
+  const tickCount = Math.min(slots.length, Math.floor(iW / 28));
+  const everyN = Math.ceil(slots.length / tickCount);
+  g.append("g").attr("class", "axis")
+    .attr("transform", `translate(0,${iH})`)
+    .call(d3.axisBottom(xScale)
+      .tickValues(slots.filter((_, i) => i % everyN === 0).map((_, ii) => ii * everyN))
+      .tickFormat(i => i + 1))
+    .selectAll("text")
+    .attr("transform", "rotate(-45)").style("text-anchor", "end");
+
+  g.append("g").attr("class", "axis").call(d3.axisLeft(yScale).ticks(5).tickFormat(v => v + " µs"));
+
+  // Axis labels
+  g.append("text").attr("x", iW / 2).attr("y", iH + 55)
+    .attr("text-anchor", "middle").style("font-size", "11px").style("fill", "var(--text-muted)")
+    .text("Kernel (execution order within layer)");
+
+  g.append("text")
+    .attr("transform", "rotate(-90)")
+    .attr("x", -iH / 2).attr("y", -46)
+    .attr("text-anchor", "middle").style("font-size", "11px").style("fill", "var(--text-muted)")
+    .text("Duration (µs)");
+
+  // Bars + error bars
+  const barW = xScale.bandwidth();
+
+  slots.forEach((s, i) => {
+    const cat = state[i];
+    const col = catColor(cat);
+    const bx = xScale(i);
+    const by = yScale(s.avg);
+    const bh = iH - by;
+
+    // bar
+    g.append("rect")
+      .attr("class", "bar-avg")
+      .attr("x", bx).attr("y", by)
+      .attr("width", barW).attr("height", Math.max(bh, 2))
+      .attr("fill", col).attr("opacity", 0.82)
+      .on("mouseenter", ev => {
+        showTT(ev,
+          `<div class="tt-name">${s.name}</div>` +
+          `<div class="tt-row"><span>Module</span><span class="tt-val">${s.module}</span></div>` +
+          `<div class="tt-row"><span>Category</span><span class="tt-val">${cat}</span></div>` +
+          `<div class="tt-row"><span>Avg</span><span class="tt-val">${s.avg} µs</span></div>` +
+          `<div class="tt-row"><span>Min</span><span class="tt-val">${s.min} µs</span></div>` +
+          `<div class="tt-row"><span>Max</span><span class="tt-val">${s.max} µs</span></div>` +
+          (s.input_dims ? `<div class="tt-row"><span>Dims</span><span class="tt-val">${s.input_dims}</span></div>` : "") +
+          (s.source ? `<div class="tt-row"><span>Source</span><span class="tt-val" style="font-size:10px">${s.source}</span></div>` : "")
+        );
+      })
+      .on("mouseleave", hideTT);
+
+    // error bar (vertical line min→max)
+    const cx = bx + barW / 2;
+    if (s.min < s.max) {
+      g.append("line").attr("class", "errorbar")
+        .attr("x1", cx).attr("x2", cx)
+        .attr("y1", yScale(s.max)).attr("y2", yScale(s.min))
+        .attr("stroke", col).attr("opacity", 0.55);
+      // caps
+      const capW = Math.min(barW * 0.4, 6);
+      [s.min, s.max].forEach(v => {
+        g.append("line").attr("class", "errorbar-cap")
+          .attr("x1", cx - capW).attr("x2", cx + capW)
+          .attr("y1", yScale(v)).attr("y2", yScale(v))
+          .attr("stroke", col).attr("opacity", 0.55);
+      });
+    }
+  });
+}
+
+// ── category bar chart ─────────────────────────────────────────────────────
+function renderCatChart(wrap, layer, typeIdx) {
+  wrap.innerHTML = "";
+  const titleEl = document.createElement("h2");
+  titleEl.textContent = "Time by Category";
+  wrap.appendChild(titleEl);
+
+  const subEl = document.createElement("p");
+  subEl.style.cssText = "font-size:11px;color:var(--text-muted);margin-bottom:12px";
+  subEl.textContent = "Sum of avg durations per category · updates on reassignment";
+  wrap.appendChild(subEl);
+
+  const totals = computeCatTotals(typeIdx);
+  const data = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+
+  const W = 300;
+  const H = 220;
+  const margin = { top: 8, right: 16, bottom: 24, left: 80 };
+  const iW = W - margin.left - margin.right;
+  const iH = H - margin.top - margin.bottom;
+
+  const svg = d3.select(wrap).append("svg")
+    .attr("width", "100%").attr("height", H)
+    .attr("viewBox", `0 0 ${W} ${H}`)
+    .style("overflow", "visible");
+
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+
+  const yScale = d3.scaleBand().domain(data.map(d => d[0])).range([0, iH]).padding(0.28);
+  const xScale = d3.scaleLinear().domain([0, d3.max(data, d => d[1]) * 1.12]).range([0, iW]).nice();
+
+  // Grid
+  g.append("g").attr("class", "grid")
+    .call(d3.axisTop(xScale).tickSize(-iH).tickFormat(""))
+    .call(gx => gx.select(".domain").remove());
+
+  // Axes
+  g.append("g").attr("class", "axis")
+    .attr("transform", `translate(0,${iH})`)
+    .call(d3.axisBottom(xScale).ticks(3).tickFormat(v => v + " µs"));
+
+  g.append("g").attr("class", "axis")
+    .call(d3.axisLeft(yScale));
+
+  // Bars
+  data.forEach(([cat, val]) => {
+    const col = catColor(cat);
+    const bh = yScale.bandwidth();
+    const by = yScale(cat);
+    const bw = xScale(val);
+
+    g.append("rect").attr("class", "bar-cat")
+      .attr("x", 0).attr("y", by)
+      .attr("width", Math.max(bw, 2)).attr("height", bh)
+      .attr("fill", col).attr("opacity", 0.82)
+      .on("mouseenter", ev => {
+        showTT(ev,
+          `<div class="tt-name">${cat}</div>` +
+          `<div class="tt-row"><span>Total avg</span><span class="tt-val">${val.toFixed(1)} µs</span></div>`
+        );
+      })
+      .on("mouseleave", hideTT);
+
+    // Direct label
+    g.append("text")
+      .attr("x", bw + 4).attr("y", by + bh / 2 + 4)
+      .style("font-size", "10px").style("fill", "var(--text-muted)")
+      .text(val.toFixed(0) + " µs");
+  });
+
+  // Legend
+  const legendEl = document.createElement("div");
+  legendEl.className = "legend";
+  legendEl.style.marginTop = "10px";
+  data.forEach(([cat]) => {
+    const item = document.createElement("div");
+    item.className = "legend-item";
+    item.innerHTML = `<span class="legend-dot" style="background:${catColor(cat)}"></span>${cat}`;
+    legendEl.appendChild(item);
+  });
+  wrap.appendChild(legendEl);
+}
+
+// ── drag-and-drop buckets ──────────────────────────────────────────────────
+function renderBuckets(wrap, layer, typeIdx) {
+  wrap.innerHTML = "";
+  const h2 = document.createElement("h2");
+  h2.textContent = "Kernel Categorization";
+  wrap.appendChild(h2);
+  const sub = document.createElement("p");
+  sub.style.cssText = "font-size:11px;color:var(--text-muted);margin-bottom:0";
+  sub.textContent = "One chip per unique kernel type. Drag to reassign — all occurrences of that kernel move together. Category chart updates live.";
+  wrap.appendChild(sub);
+
+  // Determine current set of active categories (union of default + current state)
+  const allCats = [...new Set([...layer.categories, ...layerState[typeIdx]])].sort();
+
+  const grid = document.createElement("div");
+  grid.className = "buckets-grid";
+  wrap.appendChild(grid);
+
+  // Group slots by unique kernel name; the chip represents all slots of that name.
+  // kernelGroups: name -> { slots: [slotIdx, ...], currentCat, sample }
+  const kernelGroups = {};
+  layer.slots.forEach((s, i) => {
+    const key = s.name;
+    if (!kernelGroups[key]) {
+      kernelGroups[key] = { slots: [], currentCat: layerState[typeIdx][i], sample: s };
+    }
+    kernelGroups[key].slots.push(i);
+  });
+
+  let dragKey = null;  // kernel name being dragged
+
+  function refresh() {
+    const catWrap = document.querySelector(".chart-row > .panel:last-child");
+    if (catWrap) renderCatChart(catWrap, layer, typeIdx);
+  }
+
+  allCats.forEach(cat => {
+    const bucket = document.createElement("div");
+    bucket.className = "bucket";
+    bucket.dataset.cat = cat;
+
+    const header = document.createElement("div");
+    header.className = "bucket-header";
+    header.innerHTML =
+      `<span class="bucket-dot" style="background:${catColor(cat)}"></span>` +
+      `<span>${cat}</span>`;
+    bucket.appendChild(header);
+
+    const chips = document.createElement("div");
+    chips.className = "bucket-chips";
+    bucket.appendChild(chips);
+
+    // Drop: reassign ALL slots that share the dragged kernel name
+    bucket.addEventListener("dragover", ev => {
+      ev.preventDefault();
+      bucket.classList.add("drag-over");
+    });
+    bucket.addEventListener("dragleave", () => bucket.classList.remove("drag-over"));
+    bucket.addEventListener("drop", ev => {
+      ev.preventDefault();
+      bucket.classList.remove("drag-over");
+      if (dragKey !== null && kernelGroups[dragKey]) {
+        kernelGroups[dragKey].slots.forEach(i => { layerState[typeIdx][i] = cat; });
+        kernelGroups[dragKey].currentCat = cat;
+        renderBuckets(wrap, layer, typeIdx);
+        refresh();
+      }
+    });
+
+    grid.appendChild(bucket);
+
+    // One chip per unique kernel name that currently belongs to this category
+    const seen = new Set();
+    layerState[typeIdx].forEach((curCat, slotIdx) => {
+      if (curCat !== cat) return;
+      const s = layer.slots[slotIdx];
+      if (seen.has(s.name)) return;
+      seen.add(s.name);
+
+      const grp = kernelGroups[s.name];
+      const count = grp ? grp.slots.length : 1;
+      const countTag = count > 1 ? ` ×${count}` : "";
+
+      const chip = document.createElement("div");
+      chip.className = "chip";
+      chip.draggable = true;
+      chip.title = s.name + (s.input_dims ? `\nDims: ${s.input_dims}` : "") +
+                   (count > 1 ? `\n(appears ${count}× in this layer)` : "");
+      chip.innerHTML =
+        `<span class="chip-dot" style="background:${catColor(cat)}"></span>` +
+        `<span>${trunc(s.short_name || s.name)}${countTag}</span>`;
+
+      chip.addEventListener("dragstart", () => {
+        dragKey = s.name;
+        chip.classList.add("dragging");
+      });
+      chip.addEventListener("dragend", () => {
+        dragKey = null;
+        chip.classList.remove("dragging");
+      });
+      chips.appendChild(chip);
+    });
+  });
+}
+
+// ── table view ─────────────────────────────────────────────────────────────
+function renderTable(wrap, layer, typeIdx) {
+  wrap.innerHTML = "";
+  const det = document.createElement("details");
+  const sum = document.createElement("summary");
+  sum.textContent = `▸ Table view — all ${layer.slots.length} kernels`;
+  det.appendChild(sum);
+
+  const tbl = document.createElement("table");
+  tbl.innerHTML = `<thead><tr>
+    <th>#</th><th>Short name</th><th>Module</th>
+    <th>Category</th><th>Avg (µs)</th><th>Min (µs)</th><th>Max (µs)</th>
+    <th>Input Dims</th>
+  </tr></thead>`;
+  const tbody = document.createElement("tbody");
+  layer.slots.forEach((s, i) => {
+    const tr = document.createElement("tr");
+    const cat = layerState[typeIdx][i];
+    tr.innerHTML =
+      `<td>${i + 1}</td>` +
+      `<td class="td-name" title="${s.name}">${s.short_name || s.name}</td>` +
+      `<td>${s.module}</td>` +
+      `<td><span style="display:inline-flex;align-items:center;gap:5px">` +
+        `<span style="width:8px;height:8px;border-radius:50%;background:${catColor(cat)};flex-shrink:0"></span>` +
+        `${cat}</span></td>` +
+      `<td>${s.avg}</td><td>${s.min}</td><td>${s.max}</td>` +
+      `<td style="font-size:10px;color:var(--text-muted)">${s.input_dims || ""}</td>`;
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  det.appendChild(tbl);
+  wrap.appendChild(det);
+}
+
+// ── init ───────────────────────────────────────────────────────────────────
+if (LAYERS.length) {
+  renderTabs();
+  renderPanel();
+  // Re-render timeline on resize
+  let _resizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(renderPanel, 120);
+  });
+} else {
+  document.getElementById("app").innerHTML =
+    "<p style='color:var(--text-muted);padding:40px'>No layer data found in this trace.</p>";
+}
+</script>
+</body>
+</html>"""
+
+    # ------------------------------------------------------------------
     # Callstack markdown export
     # ------------------------------------------------------------------
 
@@ -3099,7 +3843,8 @@ class TraceModuleAnalyzer:
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
                  port: int = 8765,
-                 callstack_md: Optional[str] = None):
+                 callstack_md: Optional[str] = None,
+                 layer_html: Optional[str] = None):
         self.trace_path = trace_path
         self.output_path = output_path
         self.detail_modules = detail_modules or []
@@ -3111,6 +3856,7 @@ class TraceModuleAnalyzer:
         self.model_info = model_info
         self.port = port
         self.callstack_md = callstack_md
+        self.layer_html = layer_html
 
     def run(self):
         import time as _time
@@ -3363,6 +4109,15 @@ class TraceModuleAnalyzer:
                 detail_instances=self.detail_instances,
             )
             print(f"  {_elapsed()} callstack markdown done")
+
+        if self.layer_html:
+            reporter.write_layer_html(
+                stats_list, self.layer_html, mode,
+                max_detail_modules=self.max_detail_modules,
+                detail_modules=self.detail_modules,
+                detail_instances=self.detail_instances,
+            )
+            print(f"  {_elapsed()} layer HTML done")
 
         if self.model_info and xlsx_path:
             html_path = os.path.splitext(xlsx_path)[0] + "_module_tree.html"
@@ -3899,6 +4654,12 @@ Examples:
                              "(e.g. Prefill_0 + Decode_0)")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
+    parser.add_argument("--layer-html", default=None, metavar="PATH",
+                        help="Write a self-contained interactive HTML report with D3.js "
+                             "charts: per-kernel avg/min/max bar chart across layer "
+                             "instances, drag-and-drop category buckets, and a live "
+                             "category bar chart. Opens directly in any browser. "
+                             "Example: --layer-html report.html")
     parser.add_argument("--callstack-md", default=None, metavar="PATH",
                         help="Write a Markdown file with per-kernel CPU→GPU call stacks "
                              "for each representative module instance (same instances as "
@@ -3937,11 +4698,16 @@ Examples:
         except ValueError:
             pass
 
-    # Resolve callstack-md path the same way as output
+    # Resolve relative output paths to same folder as trace file
+    trace_dir = os.path.dirname(os.path.abspath(args.trace_file))
+
     callstack_md = args.callstack_md
     if callstack_md and not os.path.isabs(callstack_md):
-        trace_dir = os.path.dirname(os.path.abspath(args.trace_file))
         callstack_md = os.path.join(trace_dir, callstack_md)
+
+    layer_html = args.layer_html
+    if layer_html and not os.path.isabs(layer_html):
+        layer_html = os.path.join(trace_dir, layer_html)
 
     try:
         analyzer = TraceModuleAnalyzer(
@@ -3956,6 +4722,7 @@ Examples:
             model_info=args.model_info,
             port=args.port,
             callstack_md=callstack_md,
+            layer_html=layer_html,
         )
         analyzer.run()
     except FileNotFoundError as e:
