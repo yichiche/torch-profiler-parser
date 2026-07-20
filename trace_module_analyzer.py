@@ -60,7 +60,7 @@ import operator
 import os
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -518,6 +518,54 @@ class KernelCorrelator:
 
 
 # ---------------------------------------------------------------------------
+# Learned kernel → module map (eager attribution transferred to graph replay)
+# ---------------------------------------------------------------------------
+
+class LearnedKernelModuleMap:
+    """kernel name → module type, learned from correlation-matched eager kernels.
+
+    Eager (non-graph) iterations attach kernels to their nn.Module precisely
+    via correlation IDs.  This map transfers that attribution to CUDA-graph-
+    replayed kernels of the same name, giving decode sub-layer module grouping
+    without kernel-name regexes.  A majority vote with a confidence threshold
+    guards against kernel names that legitimately appear under many module
+    types (e.g. generic elementwise kernels).
+    """
+
+    MIN_CONFIDENCE = 0.8
+
+    def __init__(self):
+        self._map: Dict[str, str] = {}
+        self.ambiguous = 0
+
+    @classmethod
+    def build(cls, roots: List[ModuleNode]) -> "LearnedKernelModuleMap":
+        counts: Dict[str, Counter] = defaultdict(Counter)
+        stack = list(roots)
+        while stack:
+            node = stack.pop()
+            stack.extend(node.children)
+            for k in node.kernels:
+                kname = k.get("name", "")
+                if kname:
+                    counts[kname][node.module_type] += 1
+        m = cls()
+        for kname, ctr in counts.items():
+            mtype, cnt = ctr.most_common(1)[0]
+            if cnt / sum(ctr.values()) >= cls.MIN_CONFIDENCE:
+                m._map[kname] = mtype
+            else:
+                m.ambiguous += 1
+        return m
+
+    def get(self, kernel_name: str) -> Optional[str]:
+        return self._map.get(kernel_name)
+
+    def __len__(self):
+        return len(self._map)
+
+
+# ---------------------------------------------------------------------------
 # CUDA graph replay correlator
 # ---------------------------------------------------------------------------
 
@@ -550,8 +598,12 @@ class CudaGraphCorrelator:
     def has_graph_replays(self):
         return bool(self._graph_corrs)
 
-    def correlate(self, gpu_events, capture_roots):
+    def correlate(self, gpu_events, capture_roots, learned_map=None):
         """Split graph-replayed events into synthetic layer modules.
+
+        When ``learned_map`` (LearnedKernelModuleMap) is given, kernels inside
+        each layer segment are further grouped into sub-module child nodes
+        based on the module attribution learned from eager iterations.
 
         Returns (new_roots, matched_count).
         """
@@ -599,6 +651,7 @@ class CudaGraphCorrelator:
         # 4. Build synthetic module trees for each replay
         new_roots = []
         matched = 0
+        attributed = 0
         target_idx = 0
         draft_idx = 0
         for corr in sorted(corr_to_events,
@@ -657,7 +710,11 @@ class CudaGraphCorrelator:
                     pid=root.pid,
                 )
                 layer_node._phase = "decode"
-                layer_node.kernels = layer_evts
+                if learned_map is not None:
+                    attributed += self._attach_learned_submodules(
+                        layer_node, layer_evts, learned_map)
+                else:
+                    layer_node.kernels = layer_evts
                 matched += len(layer_evts)
                 root.children.append(layer_node)
 
@@ -665,8 +722,55 @@ class CudaGraphCorrelator:
 
         if has_both:
             print(f"  CUDA graph sub-types: {target_idx} target, {draft_idx} draft")
+        if learned_map is not None and matched:
+            print(f"  Learned module attribution: {attributed:,}/{matched:,} "
+                  f"graph kernels grouped into sub-modules")
 
         return new_roots, matched
+
+    @staticmethod
+    def _attach_learned_submodules(layer_node, layer_evts, learned_map):
+        """Group consecutive same-module kernels into child nodes of the layer.
+
+        Kernels whose name has no learned attribution stay attached to the
+        layer node itself.  An unattributed kernel does NOT close the current
+        group — decode-only helper kernels frequently interleave with a
+        module's main kernels, and the surrounding module identity still
+        holds.  Returns the number of kernels attributed to a sub-module.
+        """
+        groups = []  # (module_type, [events]) in execution order
+        cur_type = None
+        cur_evts = None
+        for e in layer_evts:
+            mtype = learned_map.get(e.get("name", ""))
+            if mtype is None:
+                layer_node.kernels.append(e)
+                continue
+            if mtype != cur_type:
+                cur_type = mtype
+                cur_evts = []
+                groups.append((mtype, cur_evts))
+            cur_evts.append(e)
+
+        type_counts: Dict[str, int] = defaultdict(int)
+        attributed = 0
+        for mtype, evts in groups:
+            inst = type_counts[mtype]
+            type_counts[mtype] += 1
+            child = ModuleNode(
+                name=f"{mtype}_{inst}",
+                module_type=mtype,
+                instance_id=inst,
+                ts=evts[0].get("ts", 0),
+                end=evts[-1].get("ts", 0) + evts[-1].get("dur", 0),
+                tid=layer_node.tid,
+                pid=layer_node.pid,
+            )
+            child._phase = "decode"
+            child.kernels = evts
+            layer_node.children.append(child)
+            attributed += len(evts)
+        return attributed
 
     def _detect_layers(self, names, skip_merge=False):
         """COMM-based segmentation + half-layer merging.
@@ -859,6 +963,34 @@ def _categorize_cpu_op(name: str) -> str:
             return cat
     _categorize_cache[name] = "other"
     return "other"
+
+
+# Module-type → category fallback, applied only when the kernel-name regex
+# yields "other".  Fragments must be specific nn.Module class-name pieces —
+# never the coarse synthetic layer labels ("MoE"/"Attn"/"FC") — so a kernel
+# is only upgraded when its enclosing module identity is unambiguous.
+_MODULE_CATEGORY_RULES: List[Tuple[str, str]] = [
+    ("RMSNorm", "normalization"),
+    ("LayerNorm", "normalization"),
+    ("Rotary", "embedding"),
+    ("Embedding", "embedding"),
+    ("FusedMoE", "moe"),
+    ("MoEGate", "moe"),
+    ("MoeGate", "moe"),
+    ("TopK", "moe"),
+    ("Attention", "attention"),
+    ("MQA", "attention"),
+    ("MLA", "attention"),
+    ("SiluAndMul", "elementwise"),
+]
+
+
+def _module_type_category(module_type: str) -> Optional[str]:
+    """Category implied by an nn.Module class name, or None if inconclusive."""
+    for frag, cat in _MODULE_CATEGORY_RULES:
+        if frag in module_type:
+            return cat
+    return None
 
 
 def _parse_dims_literal(dims_str: str):
@@ -1103,6 +1235,8 @@ class ModuleAggregator:
             stats.self_kernel_time += dur
             stats.kernel_count += 1
             cat = _categorize_kernel(kname)
+            if cat == "other":
+                cat = _module_type_category(node.module_type) or "other"
             prev_dur, prev_cnt = stats.kernel_breakdown.get(cat, (0.0, 0))
             stats.kernel_breakdown[cat] = (prev_dur + dur, prev_cnt + 1)
             stats.kernel_details.append(KernelDetail(
@@ -3170,8 +3304,12 @@ class TraceModuleAnalyzer:
             # Step 3b: CUDA graph replay correlation
             if graph_correlator.has_graph_replays:
                 unmatched = [e for e in all_gpu_events if not e.get("_matched")]
+                learned_map = LearnedKernelModuleMap.build(roots)
+                print(f"  Learned kernel→module map from eager iterations: "
+                      f"{len(learned_map)} kernel names "
+                      f"({learned_map.ambiguous} ambiguous skipped)")
                 graph_roots, graph_matched = graph_correlator.correlate(
-                    unmatched, roots)
+                    unmatched, roots, learned_map=learned_map)
                 if graph_roots:
                     roots.extend(graph_roots)
                     matched += graph_matched
@@ -3435,7 +3573,9 @@ def recategorize_excel(xlsx_path: str, output_path: Optional[str] = None):
     """Re-apply kernel_categories.csv to an existing analysis Excel file.
 
     Updates Category columns and summary tables in-place (or to a new file).
-    No trace file is needed.
+    No trace file is needed.  In detail sheets, rows whose name-regex result
+    is "other" fall back to the Module column via _module_type_category, so
+    module-derived categories from the original analysis are preserved.
     """
     try:
         import openpyxl
@@ -3478,13 +3618,16 @@ def recategorize_excel(xlsx_path: str, output_path: Optional[str] = None):
                 break
         if not header_row or not name_col:
             continue
-        # Find Category and Duration columns
+        # Find Category, Duration and Module columns
+        mod_col = None
         for c in range(1, ws.max_column + 1):
             val = ws.cell(header_row, c).value
             if val == "Category":
                 cat_col = c
             elif val == "Duration (us)":
                 dur_col = c
+            elif val == "Module":
+                mod_col = c
         if not cat_col:
             continue
 
@@ -3496,6 +3639,10 @@ def recategorize_excel(xlsx_path: str, output_path: Optional[str] = None):
                 break
             old_cat = ws.cell(r, cat_col).value or ""
             new_cat = classify(str(kname))
+            if new_cat == "other" and mod_col:
+                mod_val = ws.cell(r, mod_col).value
+                if mod_val:
+                    new_cat = _module_type_category(str(mod_val)) or "other"
             if old_cat != new_cat:
                 ws.cell(r, cat_col).value = new_cat
                 changes += 1
