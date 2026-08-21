@@ -1417,8 +1417,15 @@ class ReportGenerator:
                 print(f"\nInstance {module_index} not found for '{detail_module}'. "
                       f"Available: {sorted(set(m.instance_id for m in matches))}")
                 return
-            selected = target[0]
-            pick_reason = "user-specified"
+            selected = self._pick_detail_instance(target, mode, module_index)
+            if len(target) > 1:
+                n_stub = sum(1 for s in target
+                             if self._is_graph_comm_stub(s, mode))
+                pick_reason = (f"user-specified id={module_index}, "
+                               f"best of {len(target)} variants"
+                               + (f" ({n_stub} stub(s) skipped)" if n_stub else ""))
+            else:
+                pick_reason = "user-specified"
         else:
             # Pick instance closest to median (most representative)
             selected, pick_reason = self._pick_median_instance(matches, mode)
@@ -1955,7 +1962,9 @@ class ReportGenerator:
         instance_detail_list: List[Tuple[ModuleStats, str]] = []
         if detail_instances:
             all_by_type_for_inst: Dict[str, List[ModuleStats]] = defaultdict(list)
-            self._collect_instances_by_type(tree_root_stats, all_by_type_for_inst)
+            # Search the full filtered stats tree (not just Module Tree roots)
+            # so --detail-instance finds every CUDA graph variant.
+            self._collect_instances_by_type(stats_list, all_by_type_for_inst)
             inst_ids = list(detail_instances)
             used_sheet_titles: set = set()
 
@@ -1983,10 +1992,7 @@ class ReportGenerator:
                             continue
                         k = occ[(mtype, iid)]
                         occ[(mtype, iid)] += 1
-                        if k >= len(cands):
-                            print(f"  WARNING: only {len(cands)} occurrence(s) of "
-                                  f"{mtype!r} instance_id={iid}; reusing last")
-                        s = cands[min(k, len(cands) - 1)]
+                        s = self._pick_detail_instance(cands, mode, iid, k)
                         _append_instance_sheet(s)
                 else:
                     mtype = detail_module_order[0]
@@ -1994,22 +2000,14 @@ class ReportGenerator:
                     matches = [s for s in all_by_type_for_inst.get(mtype, [])
                                if s.instance_id in requested]
                     if matches:
-                        best_per_id: Dict[int, ModuleStats] = {}
+                        by_id: Dict[int, List[ModuleStats]] = defaultdict(list)
                         for s in matches:
-                            prev = best_per_id.get(s.instance_id)
-                            if prev is None:
-                                best_per_id[s.instance_id] = s
-                            else:
-                                st = (s.total_kernel_time if mode == "full"
-                                      else s.total_cpu_op_time)
-                                pt = (prev.total_kernel_time if mode == "full"
-                                      else prev.total_cpu_op_time)
-                                if st > pt:
-                                    best_per_id[s.instance_id] = s
+                            by_id[s.instance_id].append(s)
                         for iid in inst_ids:
-                            s = best_per_id.get(iid)
-                            if s is not None:
-                                _append_instance_sheet(s)
+                            cands = by_id.get(iid)
+                            if cands:
+                                _append_instance_sheet(
+                                    self._pick_detail_instance(cands, mode, iid))
                             else:
                                 print(f"  WARNING: instance ID {iid} not found for "
                                       f"{mtype!r}")
@@ -2020,21 +2018,12 @@ class ReportGenerator:
                                if s.instance_id in requested]
                     if matches:
                         instance_override_types.add(mtype)
-                        best_per_id: Dict[int, ModuleStats] = {}
+                        by_id: Dict[int, List[ModuleStats]] = defaultdict(list)
                         for s in matches:
-                            prev = best_per_id.get(s.instance_id)
-                            if prev is None:
-                                best_per_id[s.instance_id] = s
-                            else:
-                                s_time = (s.total_kernel_time if mode == "full"
-                                          else s.total_cpu_op_time)
-                                prev_time = (prev.total_kernel_time if mode == "full"
-                                             else prev.total_cpu_op_time)
-                                if s_time > prev_time:
-                                    best_per_id[s.instance_id] = s
-                        for iid in sorted(best_per_id):
-                            s = best_per_id[iid]
-                            _append_instance_sheet(s)
+                            by_id[s.instance_id].append(s)
+                        for iid in sorted(by_id):
+                            _append_instance_sheet(
+                                self._pick_detail_instance(by_id[iid], mode, iid))
                 not_found = requested - {s.instance_id for s, _ in instance_detail_list}
                 if not_found:
                     print(f"  WARNING: instance IDs not found: {sorted(not_found)}")
@@ -2881,6 +2870,64 @@ class ReportGenerator:
             ReportGenerator._collect_tree_instances(child, out, skip_types)
 
     @staticmethod
+    def _instance_time(stats: ModuleStats, mode: str) -> float:
+        return stats.total_kernel_time if mode == "full" else stats.total_cpu_op_time
+
+    @staticmethod
+    def _is_graph_comm_stub(stats: ModuleStats, mode: str) -> bool:
+        """True for CUDA graph allreduce/RMSNorm stub captures (~1 kernel, ~100% comm)."""
+        if stats.kernel_count != 1:
+            return False
+        bd = stats.kernel_breakdown or {}
+        comm = bd.get("communication", (0, 0))[0]
+        t = ReportGenerator._instance_time(stats, mode)
+        return t > 0 and comm >= t * 0.9
+
+    @staticmethod
+    def _moe_fraction(stats: ModuleStats, mode: str) -> float:
+        bd = stats.kernel_breakdown or {}
+        moe = bd.get("moe", (0, 0))[0]
+        t = ReportGenerator._instance_time(stats, mode)
+        return moe / t if t > 0 else 0.0
+
+    @classmethod
+    def _pick_detail_instance(cls, candidates: List[ModuleStats], mode: str,
+                              instance_id: int, occurrence: int = 0) -> ModuleStats:
+        """Pick one module among CUDA graph variants sharing an instance_id."""
+        if len(candidates) == 1:
+            return candidates[0]
+        ranked = cls._rank_instances_by_time(candidates, mode)
+        non_stub = [s for s in ranked if not cls._is_graph_comm_stub(s, mode)]
+        pool = non_stub if non_stub else ranked
+        moe_cands = [s for s in pool if cls._moe_fraction(s, mode) >= 0.4]
+        linear_cands = [s for s in pool if cls._moe_fraction(s, mode) < 0.4]
+        if moe_cands and linear_cands:
+            # Hybrid models (e.g. Qwen3.5): odd layers MoE, even layers GDN/Linear.
+            if instance_id % 2 == 1:
+                profile_pool = sorted(
+                    moe_cands, key=lambda s: -cls._instance_time(s, mode))
+            else:
+                profile_pool = sorted(
+                    linear_cands, key=lambda s: -cls._instance_time(s, mode))
+        else:
+            profile_pool = pool
+        return profile_pool[min(occurrence, len(profile_pool) - 1)]
+
+    @staticmethod
+    def _rank_instances_by_time(instances: List[ModuleStats],
+                                mode: str) -> List[ModuleStats]:
+        """Order duplicate instance_id matches: fullest variant first.
+
+        Sort by total time, then kernel count, so CUDA graph stub captures
+        (1 kernel, ~6 us allreduce) lose to full MoE/GDN paths (~200 us).
+        """
+        return sorted(
+            instances,
+            key=lambda s: (-ReportGenerator._instance_time(s, mode),
+                           -s.kernel_count,
+                           s.name))
+
+    @staticmethod
     def _dedup_by_instance_id(instances: List[ModuleStats],
                               mode: str) -> List[ModuleStats]:
         """Keep one instance per unique instance_id (the one with most kernel time)."""
@@ -2890,9 +2937,7 @@ class ReportGenerator:
             if prev is None:
                 best[s.instance_id] = s
             else:
-                s_time = s.total_kernel_time if mode == "full" else s.total_cpu_op_time
-                prev_time = prev.total_kernel_time if mode == "full" else prev.total_cpu_op_time
-                if s_time > prev_time:
+                if ReportGenerator._instance_time(s, mode) > ReportGenerator._instance_time(prev, mode):
                     best[s.instance_id] = s
         return sorted(best.values(), key=lambda s: s.instance_id)
 
@@ -3241,9 +3286,7 @@ class TraceModuleAnalyzer:
                         max_detail_modules=self.max_detail_modules,
                         detail_modules=self.detail_modules,
                         stable_detail_sheet_names=self.stable_detail_sheet_names)
-                    for dm in self.detail_modules:
-                        reporter.print_layer_detail(stats_list, mode, dm,
-                                                    self.module_index)
+                    self._print_detail_modules(reporter, stats_list, mode)
                     print(f"  {_elapsed()} console output done")
 
                     xlsx_path = self.output_path
@@ -3349,9 +3392,7 @@ class TraceModuleAnalyzer:
             detail_modules=self.detail_modules,
             stable_detail_sheet_names=self.stable_detail_sheet_names)
 
-        for dm in self.detail_modules:
-            reporter.print_layer_detail(stats_list, mode, dm,
-                                        self.module_index)
+        self._print_detail_modules(reporter, stats_list, mode)
 
         print(f"  {_elapsed()} console output done")
 
@@ -3391,6 +3432,26 @@ class TraceModuleAnalyzer:
                     os.unlink(tmp_xlsx)
                 except OSError:
                     pass
+
+
+    def _print_detail_modules(self, reporter: "ReportGenerator",
+                              stats_list: List[ModuleStats], mode: str):
+        """Print console layer detail for --detail-module / --detail-instance."""
+        if not self.detail_modules:
+            return
+        if self.detail_instances:
+            dmods = list(self.detail_modules)
+            dinsts = list(self.detail_instances)
+            if len(dmods) == len(dinsts):
+                for dm, di in zip(dmods, dinsts):
+                    reporter.print_layer_detail(stats_list, mode, dm, di)
+                return
+            if len(dmods) == 1:
+                for di in dinsts:
+                    reporter.print_layer_detail(stats_list, mode, dmods[0], di)
+                return
+        for dm in self.detail_modules:
+            reporter.print_layer_detail(stats_list, mode, dm, self.module_index)
 
     def _propagate_phase(self, nodes: List[ModuleNode]):
         """Propagate phase from parent to children if not set."""
