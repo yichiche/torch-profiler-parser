@@ -62,7 +62,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +125,8 @@ class ModuleStats:
     module_type: str
     instance_id: int
     depth: int
+    ts: float = 0.0     # source ModuleNode span start / end (us)
+    end: float = 0.0
     total_kernel_time: float = 0.0
     total_cpu_op_time: float = 0.0
     self_kernel_time: float = 0.0
@@ -135,6 +137,12 @@ class ModuleStats:
     kernel_details: List[KernelDetail] = field(default_factory=list)  # all kernels/ops in time order
     children_stats: List["ModuleStats"] = field(default_factory=list)
     phase: str = ""  # "prefill" / "decode" / ""
+    # Set on forward-pass roots by PassClassifier: "prefill" / "extend" /
+    # "decode" / "" (unknown), plus the seqlens it was derived from.
+    pass_kind: str = ""
+    pass_q: int = 0
+    pass_kv: int = 0
+    attn_kernels: Dict[str, Tuple[int, float]] = field(default_factory=dict)
     # Ancestor path from nn.Module root to this node's parent ("" at roots).
     parent_tree_path: str = ""
 
@@ -1225,8 +1233,16 @@ class ModuleAggregator:
             module_type=node.module_type,
             instance_id=node.instance_id,
             depth=depth,
+            ts=node.ts,
+            end=node.end,
         )
         stats.parent_tree_path = parent_path
+        pass_info = getattr(node, "_pass_info", None)
+        if pass_info:
+            stats.pass_kind = pass_info["kind"]
+            stats.pass_q = pass_info["q"]
+            stats.pass_kv = pass_info["kv"]
+            stats.attn_kernels = pass_info["attn_kernels"]
 
         # Direct kernel stats
         for k in node.kernels:
@@ -1281,6 +1297,111 @@ class ModuleAggregator:
                 stats.kernel_breakdown[cat] = (prev_dur + dur, prev_cnt + cnt)
 
         return stats
+
+
+# ---------------------------------------------------------------------------
+# Forward-pass classifier (prefill vs extend vs decode)
+# ---------------------------------------------------------------------------
+
+class PassClassifier:
+    """Label each forward-pass root prefill / extend / decode.
+
+    A chunked prefill emits one eager forward pass per chunk, all sharing the
+    same root name.  Chunk 0 has no prefix in the KV cache; chunks 1..N do.
+    That -- the presence of a prefix -- *is* the definition of extend, and it
+    is what this reads: the attention op records ``max_seqlen_q`` and
+    ``max_seqlen_k`` among its own arguments, so
+
+        max_seqlen_k > max_seqlen_q  <=>  the batch carries a prefix
+
+    holds no matter which kernel the backend then dispatched to.  Classifying
+    by kernel name instead would be circular: the whole point of the split is
+    usually to check *whether* extend got routed to the kernel you expect, and
+    a mis-routed extend pass must still be labelled extend.
+
+    Attention ops are picked out of the whole cpu_op stream by shape (see
+    ``_find_attention_calls``) and then assigned to whichever forward-pass root
+    span contains their timestamp; the root takes the largest ``max_seqlen_k``
+    seen inside it.  Matching on shape rather than on op name means
+    ``aiter::fmha_v3_varlen_fwd``, ``aiter::mha_batch_prefill`` and their
+    equivalents on other backends are all caught without a name list.
+
+    This mirrors what SGLang itself branches on -- aiter_backend's chunked
+    prefill path tests ``any(forward_batch.extend_prefix_lens_cpu)`` -- but from
+    the recorded seqlens rather than the branch taken.  The one gap: both are
+    batch-wide reductions, so a mixed batch where the longest-q request has no
+    prefix and a short-q request does (max_q == max_k, yet some prefix exists)
+    reads as prefill here.  The q/kv columns of --list-passes make that visible.
+    """
+
+    ATTN_MODULE = "RadixAttention"
+
+    def classify(self, roots: List[ModuleNode], cpu_ops: List[Dict]) -> None:
+        calls = self._find_attention_calls(cpu_ops)
+        calls.sort(key=operator.itemgetter(0))
+        call_ts = [c[0] for c in calls]
+        for root in roots:
+            root._pass_info = self._classify_root(  # type: ignore[attr-defined]
+                root, calls, call_ts)
+
+    def _classify_root(self, root: ModuleNode, calls, call_ts) -> Dict[str, Any]:
+        info: Dict[str, Any] = {"kind": "", "q": 0, "kv": 0,
+                                "attn_kernels": {}}
+        if root.module_type.startswith("CudaGraphReplay"):
+            info["kind"] = "decode"
+            return info
+        self._collect_kernels(root, info)
+        lo = bisect.bisect_left(call_ts, root.ts)
+        hi = bisect.bisect_right(call_ts, root.end)
+        for _, q, kv in calls[lo:hi]:
+            if kv > info["kv"]:
+                info["q"], info["kv"] = q, kv
+        if info["kv"]:
+            info["kind"] = "extend" if info["kv"] > info["q"] else "prefill"
+        return info
+
+    def _collect_kernels(self, node: ModuleNode, info: Dict[str, Any]) -> None:
+        if self.ATTN_MODULE in node.module_type and "Linear" not in node.module_type:
+            for k in node.kernels:
+                cnt, dur = info["attn_kernels"].get(k.get("name", ""), (0, 0.0))
+                info["attn_kernels"][k.get("name", "")] = (
+                    cnt + 1, dur + k.get("dur", 0))
+        for child in node.children:
+            self._collect_kernels(child, info)
+
+    @classmethod
+    def _find_attention_calls(cls, cpu_ops: List[Dict]) -> List[Tuple[float, int, int]]:
+        """Pick out attention entry-point ops and read their (q, kv) seqlens.
+
+        Matched structurally rather than by name so this survives a backend
+        swap: q/k/v are the first three inputs, k and v share a shape, q and k
+        share a head_dim, q has at least as many heads as k, and two adjacent
+        Concrete Inputs are the max seqlens.
+        """
+        out = []
+        for op in cpu_ops:
+            name = str(op.get("name", ""))
+            if name.startswith("aten::") or "::" not in name:
+                continue
+            args = op.get("args") or {}
+            dims = args.get("Input Dims") or []
+            if len(dims) < 3:
+                continue
+            d_q, d_k, d_v = dims[0], dims[1], dims[2]
+            if len(d_q) != 3 or len(d_k) != 3 or d_k != d_v:
+                continue
+            if d_q[2] != d_k[2] or d_q[1] < d_k[1]:
+                continue
+            ci = args.get("Concrete Inputs") or []
+            for i in range(len(ci) - 1):
+                a, b = str(ci[i]).strip(), str(ci[i + 1]).strip()
+                if not (a.isdigit() and b.isdigit()):
+                    continue
+                q, kv = int(a), int(b)
+                if 1 <= q <= d_q[0] and kv >= q:
+                    out.append((op.get("ts", 0.0), q, kv))
+                break
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -3104,6 +3225,7 @@ class TraceModuleAnalyzer:
                  module_index: Optional[int] = None,
                  detail_instances: Optional[List[int]] = None,
                  phase_index=None,
+                 list_passes: bool = False,
                  max_detail_modules: int = 3,
                  auto_fix_rocm: bool = True,
                  model_info: bool = False,
@@ -3115,6 +3237,7 @@ class TraceModuleAnalyzer:
         self.module_index = module_index
         self.detail_instances = detail_instances
         self.phase_index = phase_index
+        self.list_passes = list_passes
         self.max_detail_modules = max_detail_modules
         self.auto_fix_rocm = auto_fix_rocm
         self.model_info = model_info
@@ -3226,6 +3349,7 @@ class TraceModuleAnalyzer:
                     phase_detector = PhaseDetector()
                     phase_detector.detect_from_markers(roots, phase_markers)
                     self._propagate_phase(roots)
+                    PassClassifier().classify(roots, cpu_ops)
 
                     print(f"  {_elapsed()} phase detection done")
                     print("\nAggregating module statistics...")
@@ -3323,13 +3447,13 @@ class TraceModuleAnalyzer:
             correlator = CpuOpCorrelator(roots)
             matched = correlator.correlate(cpu_ops, roots)
             print(f"  Matched {matched:,} / {len(cpu_ops):,} cpu_ops to modules")
-            del cpu_ops
 
         print(f"  {_elapsed()} correlation done")
         # Step 4: Detect prefill vs decode phase
         phase_detector = PhaseDetector()
         phase_detector.detect_from_markers(roots, phase_markers)
         self._propagate_phase(roots)
+        PassClassifier().classify(roots, cpu_ops)
 
         # Step 5: Aggregate stats
         print(f"  {_elapsed()} phase detection done")
@@ -3338,6 +3462,9 @@ class TraceModuleAnalyzer:
         stats_list = aggregator.aggregate(roots, mode)
         # Propagate phase from nodes
         self._copy_phase_to_stats(roots, stats_list)
+        if self.list_passes:
+            self._print_pass_table(stats_list)
+            return
         stats_list = self._filter_by_phase_index(stats_list)
 
         print(f"  {_elapsed()} aggregation done")
@@ -3411,22 +3538,189 @@ class TraceModuleAnalyzer:
             stats.phase = getattr(node, "_phase", "")
             self._copy_phase_to_stats(node.children, stats.children_stats)
 
+    @staticmethod
+    def _stats_has_kernel(stats: ModuleStats, needle: str) -> bool:
+        """True if any kernel in this root's subtree matches `needle`."""
+        stack = [stats]
+        while stack:
+            s = stack.pop()
+            for kd in s.kernel_details:
+                if needle in kd.name:
+                    return True
+            stack.extend(s.children_stats)
+        return False
+
+    @staticmethod
+    def _parse_occurrences(spec: str) -> Optional[Set[int]]:
+        """Parse the '#...' part of Name#3, Name#3,5 or Name#3-7."""
+        out: Set[int] = set()
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part.lstrip("-"):
+                lo, _, hi = part.partition("-")
+                try:
+                    out.update(range(int(lo), int(hi) + 1))
+                except ValueError:
+                    return None
+            else:
+                try:
+                    out.add(int(part))
+                except ValueError:
+                    return None
+        return out or None
+
+    @staticmethod
+    def _print_pass_table(stats_list: List[ModuleStats]) -> None:
+        """Show every forward pass with the facts needed to pick one.
+
+        `kind` comes from the attention op's seqlens (prefix present or not);
+        `attention kernels` is what actually ran.  Reading them side by side is
+        how you spot an extend pass that never got re-routed.
+        """
+        rows = sorted((s for s in stats_list if s.pass_kind),
+                      key=operator.attrgetter("ts"))
+        if not rows:
+            print("\n  No forward-pass roots found (no full-attention module "
+                  "with recorded seqlens).")
+            return
+        t0 = rows[0].ts
+        print(f"\n{'=' * 106}\n  Forward passes\n{'=' * 106}")
+        print(f"  {'idx':>4}  {'root':<26} {'rel_ts(ms)':>11} {'kind':<8} "
+              f"{'q':>7} {'kv':>8} {'prefix':>8}  attention kernels")
+        print(f"  {'-' * 102}")
+        by_name: Dict[str, int] = defaultdict(int)
+        run: List[ModuleStats] = []
+
+        def flush_decode_run():
+            # decode is one CudaGraphReplay root per step -- thousands of rows
+            # that say nothing individually, so collapse each consecutive run
+            if not run:
+                return
+            names = Counter(s.name.rsplit("_", 1)[0] for s in run)
+            total = sum(s.total_kernel_time for s in run)
+            print(f"  {'':>4}  {'... decode x' + str(len(run)):<27} "
+                  f"{(run[0].ts - t0) / 1000:>10.1f} {'decode':<8} "
+                  f"{'':>7} {'':>8} {'':>8}  "
+                  f"{', '.join(f'{n} x{c}' for n, c in names.most_common())} "
+                  f"({total / 1000:.0f}ms)")
+            run.clear()
+
+        for i, s in enumerate(rows):
+            if s.pass_kind == "decode":
+                run.append(s)
+                continue
+            flush_decode_run()
+            occ = by_name[s.name]
+            by_name[s.name] += 1
+            kernels = ", ".join(
+                f"{n[:46]} x{c} ({d/1000:.0f}ms)"
+                for n, (c, d) in sorted(s.attn_kernels.items(),
+                                        key=lambda kv: -kv[1][1])[:2]) or "-"
+            prefix = s.pass_kv - s.pass_q if s.pass_kv else 0
+            print(f"  {i:>4}  {s.name[:24]:<24}#{occ:<2} "
+                  f"{(s.ts - t0) / 1000:>10.1f} {s.pass_kind:<8} "
+                  f"{s.pass_q:>7} {s.pass_kv:>8} {prefix:>8}  {kernels}")
+        flush_decode_run()
+        print()
+        # One iteration yields several roots on a speculative-decoding run (the
+        # target model and the draft head are separate nn.Modules), so break the
+        # count down by root rather than printing a single misleading total.
+        for kind in ("prefill", "extend", "decode"):
+            group = [s for s in rows if s.pass_kind == kind]
+            if not group:
+                continue
+            names = Counter(s.module_type for s in group)
+            print(f"  {kind:<8} {len(group):>5} roots  "
+                  + ", ".join(f"{n} x{c}" for n, c in names.most_common()))
+        print("\n  Select with --phase-index prefill | extend | decode, "
+              "or <root>#<n> using the # column above.")
+
+    @staticmethod
+    def _with_iteration_companions(stats_list: List[ModuleStats],
+                                   picked: List[ModuleStats],
+                                   same_named: List[ModuleStats]
+                                   ) -> List[ModuleStats]:
+        """Add the other roots belonging to the picked forward passes.
+
+        On an MTP/EAGLE run the target model is one root and the draft head is
+        a *separate* root that starts after the target span (the CPU blocks on
+        the sampler sync in between), so picking the model root alone loses the
+        draft head's layer.  A pass therefore owns every non-matching root that
+        starts before the next same-named root.
+        """
+        if not picked:
+            return []
+        starts = [s.ts for s in same_named]
+        chosen_ids = {id(s) for s in picked}
+        out = list(picked)
+        for s in stats_list:
+            if id(s) in chosen_ids:
+                continue
+            if s.module_type.startswith("CudaGraphReplay"):
+                # decode replays that happened while this pass waited on the
+                # sampler sync are a different iteration, not a companion
+                continue
+            nxt = bisect.bisect_right(starts, s.ts) - 1
+            if nxt < 0:
+                continue
+            owner = same_named[nxt]
+            if id(owner) in chosen_ids and s.ts < (
+                    starts[nxt + 1] if nxt + 1 < len(starts) else float("inf")):
+                out.append(s)
+        return sorted(out, key=operator.attrgetter("ts"))
+
     def _filter_by_phase_index(self, stats_list: List[ModuleStats]) -> List[ModuleStats]:
         if self.phase_index is None:
             return stats_list
         val = self.phase_index
         if isinstance(val, int):
             filtered = [s for s in stats_list if s.instance_id == val]
+        elif val in ("prefill", "extend", "decode"):
+            # Semantic selection: PassClassifier derived this from the
+            # attention op's own max_seqlen_q / max_seqlen_k, not from which
+            # kernel ran, so a mis-routed extend pass still lands in "extend".
+            anchors = sorted((s for s in stats_list if s.pass_kind),
+                             key=operator.attrgetter("ts"))
+            picked = [s for s in anchors if s.pass_kind == val]
+            filtered = self._with_iteration_companions(
+                stats_list, picked, anchors)
+        elif val.startswith("kernel:"):
+            # Chunked prefill emits one root *per forward pass*, all with the
+            # same name, so a name/index filter cannot separate the first
+            # (plain prefill) chunk from the later extend chunks.  Selecting by
+            # the attention kernel each root launched can: this also keeps the
+            # MTP/draft-head root of the same iteration, which is a separate
+            # root carrying the last layer's attention kernel.
+            needle = val[len("kernel:"):]
+            filtered = [s for s in stats_list
+                        if self._stats_has_kernel(s, needle)]
+        elif "#" in val:
+            name, _, occ_spec = val.rpartition("#")
+            occurrences = self._parse_occurrences(occ_spec)
+            same = sorted((s for s in stats_list if s.name == name),
+                          key=operator.attrgetter("ts"))
+            if occurrences is None:
+                filtered = []
+            else:
+                picked = [s for i, s in enumerate(same) if i in occurrences]
+                filtered = self._with_iteration_companions(
+                    stats_list, picked, same)
         else:
             filtered = [s for s in stats_list if s.name == val]
-        kept = [s.name for s in filtered]
         dropped = len(stats_list) - len(filtered)
-        if kept:
-            print(f"  --phase-index {val}: kept {', '.join(kept)} "
-                  f"(dropped {dropped} other roots)")
+        if filtered:
+            by_name = Counter(s.name for s in filtered)
+            kept = ", ".join(f"{n} x{c}" if c > 1 else n
+                             for n, c in by_name.most_common())
+            print(f"  --phase-index {val}: kept {len(filtered)} root(s) "
+                  f"[{kept}] (dropped {dropped} other roots)")
         else:
+            avail = Counter(s.name for s in stats_list)
             print(f"  WARNING: --phase-index {val} matched no roots. "
-                  f"Available: {', '.join(s.name for s in stats_list)}")
+                  f"Available: "
+                  f"{', '.join(f'{n} x{c}' for n, c in avail.most_common())}")
         return filtered
 
     def _build_atom_module_tree(self, gpu_phase_events: List[Dict],
@@ -3831,10 +4125,25 @@ Examples:
     parser.add_argument("--port", type=int, default=8765,
                         help="HTTP server port for --model-info (default: 8765)")
     parser.add_argument("--phase-index", default=None,
-                        help="Restrict analysis to a specific forward pass. "
-                             "Use a name like Prefill_0 or Decode_2 for a single root, "
-                             "or an integer like 0 to keep all roots with that index "
-                             "(e.g. Prefill_0 + Decode_0)")
+                        help="Restrict analysis to specific forward passes. Accepts: "
+                             "prefill / extend / decode (classified from the attention "
+                             "op's seqlens, independent of which kernel ran -- run "
+                             "--list-passes to see the table); "
+                             "a root name (CudaGraphReplay_Target_0); "
+                             "an integer index kept across roots (0); "
+                             "NAME#N / NAME#N,M / NAME#N-M to pick the Nth occurrence of "
+                             "a repeated root (chunked prefill emits one identically "
+                             "named root per pass); or "
+                             "kernel:SUBSTRING to keep roots that launched a matching "
+                             "kernel (a cross-check, not a phase classifier -- do not use "
+                             "it to decide what is extend)")
+    parser.add_argument("--list-passes", action="store_true",
+                        help="List every forward pass (index, kind, seqlens, attention "
+                             "kernels) and exit. `kind` is derived from the attention "
+                             "op's max_seqlen_q vs max_seqlen_k -- i.e. from whether the "
+                             "batch has a prefix -- not from which kernel ran, so an "
+                             "extend pass that was never re-routed still shows as extend "
+                             "next to the old kernel it used.")
     parser.add_argument("--no-rocm-fix", action="store_true",
                         help="Disable automatic ROCm trace fix (hipGraphLaunch flow events)")
     parser.add_argument("--stable-detail-sheet-names", action="store_true",
@@ -3882,6 +4191,7 @@ Examples:
             module_index=args.module_index,
             detail_instances=args.detail_instance,
             phase_index=phase_index,
+            list_passes=args.list_passes,
             max_detail_modules=args.max_detail_modules if args.max_detail_modules > 0 else 999,
             auto_fix_rocm=not args.no_rocm_fix,
             model_info=args.model_info,
