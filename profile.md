@@ -58,6 +58,9 @@ python3 trace_module_analyzer.py trace.json.gz --no-rocm-fix
 | `--max-detail-modules` | 3 | Number of module types to generate detail sheets for (0=all) |
 | `--detail-module` | None | Specify module types for kernel-by-kernel detail |
 | `--module-index` | median | Which occurrence of the module to show detail for |
+| `--detail-instance` | None | Instance ids to emit detail sheets for (paired with `--detail-module`) |
+| `--list-passes` | off | Print the forward-pass table (index, kind, seqlens, attention kernels) and exit |
+| `--phase-index` | None | Restrict to forward passes: `prefill`/`extend`/`decode`, root name, integer index, `NAME#N`/`NAME#N-M`, or `kernel:SUBSTRING` (see [Separating prefill / extend / decode](#separating-prefill--extend--decode---list-passes---phase-index)) |
 | `--model-info` | off | Generate interactive module tree HTML and start HTTP server |
 | `--port` | 8765 | HTTP server port for `--model-info` |
 | `--no-rocm-fix` | off | Disable automatic ROCm trace fix |
@@ -109,6 +112,118 @@ python3 visualize_module_tree.py analysis.xlsx -o tree.html --serve --port 9000
 ### kernel_projection.py — Kernel Improvement Projector
 
 Estimates TTFT/ITL impact from kernel-level improvements.
+
+### Separating prefill / extend / decode (`--list-passes`, `--phase-index`)
+
+In a chunked-prefill trace **every eager forward pass is the same root**
+(`nn.Module: <Model>_0`), so a plain `--phase-index <name>` keeps all of them
+and the report ends up dominated by the first prefill chunk plus decode.
+
+Start with the pass table:
+
+```bash
+python3 trace_module_analyzer.py trace.json.gz --list-passes
+```
+
+```
+ idx  root                     rel_ts(ms) kind        q       kv   prefix  attention kernels
+  801  Qwen3_5MoeForCausalLM_0 #12 12720.5 prefill 16384    16384        0  aiter::fmha_fwd_hd256_fp8_causal_group_gfx950 x15 (14ms)
+  803  Qwen3_5MoeForCausalLM_0 #13 13187.8 extend  16384    32768    16384  _ZN7ck_tile6kentryILi1ENS_38FmhaBatchPrefillWi x15 (140ms)
+       ... decode x777             8938.8 decode                           CudaGraphReplay_Draft x518, CudaGraphReplay_Target x259 (3505ms)
+```
+
+`kind` comes from the attention op's own `max_seqlen_q` / `max_seqlen_k`
+arguments: `max_seqlen_k > max_seqlen_q` means the batch carries a prefix, which
+*is* the definition of extend. **It never looks at which kernel ran** — that
+would be circular, since the usual reason to split the phases is to check
+whether extend got routed to the kernel you expect. Reading `kind` and
+`attention kernels` side by side is how you spot an extend pass that was never
+re-routed (above: extend is still on the old `ck_tile` paged-KV kernel).
+
+The op is matched structurally, not by name — q/k/v are the first three inputs,
+k and v share a shape, q and k share a head_dim — so it survives a backend swap.
+CUDA-graph replay roots are decode by construction; consecutive ones are
+collapsed into a single row.
+
+This mirrors what SGLang branches on itself (`aiter_backend.forward_extend`
+tests `any(forward_batch.extend_prefix_lens_cpu)`), read from the seqlens rather
+than from the branch taken. Both are batch-wide reductions, so the one blind
+spot is a mixed batch whose longest-q request has no prefix while a short-q one
+does — `max_q == max_k` and it reads as prefill. The q/kv columns make that
+case visible.
+
+Then select:
+
+```bash
+python3 trace_module_analyzer.py trace.json.gz -o analysis_prefill.xlsx --phase-index prefill
+python3 trace_module_analyzer.py trace.json.gz -o analysis_extend.xlsx  --phase-index extend
+python3 trace_module_analyzer.py trace.json.gz -o analysis_decode.xlsx  --phase-index decode
+
+# or pick exact passes off the # column: NAME#N, NAME#N,M, NAME#N-M
+python3 trace_module_analyzer.py trace.json.gz -o analysis.xlsx \
+    --phase-index 'Qwen3_5MoeForCausalLM_0#1-4' \
+    --detail-module Qwen3_5AttentionDecoderLayer --detail-instance 5
+```
+
+All forms compose with `--detail-module` / `--detail-instance` as usual.
+
+`kernel:SUBSTRING` also exists (keep every root that launched a matching
+kernel). Use it as a **cross-check** — "which passes ran this kernel?" — not as
+a phase classifier.
+
+**MTP/EAGLE runs:** the target model and the draft head are *separate* roots —
+the CPU blocks on the sampler sync between them, so the head starts long after
+the target span ends and carries the last layer's attention kernel. It is
+classified on its own seqlens, and the `NAME#N` form additionally pulls in every
+non-`CudaGraphReplay` root that starts before the next same-named root. Miss
+this and you get 15 of 16 attention layers.
+
+**Eager decode:** if decode is not CUDA-graph captured it has no
+`CudaGraphReplay` root and shows up as `extend` (a target-verify step does carry
+a prefix). The `q` column disambiguates — it is the speculation depth, not a
+chunk size.
+
+### extract_phase_trace.py — Forward-Pass Trace Slicer
+
+Does the same selection but writes a **smaller trace file** instead of a report
+— use it when the full capture is too big to open in Perfetto, or to hand a
+colleague just the interesting passes. For analysis, prefer `--phase-index`
+above: same numbers, one command, no intermediate file.
+
+It labels each eager forward pass by the attention kernel it launched, keeps the
+passes you ask for, and follows `correlation` ids so the GPU kernels come along
+— GPU work lags its CPU span by a whole iteration on long-context runs, so a
+naive time cut would lose it.
+
+```bash
+python3 extract_phase_trace.py trace.json.gz --list            # pass table
+python3 extract_phase_trace.py trace.json.gz -o EXTEND_only.trace.json.gz \
+    --select-kernel extend
+python3 extract_phase_trace.py trace.json.gz -o slice.json.gz --select-pass 1 2 3 4
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--list` | off | Print the pass table and exit |
+| `--root-module` | `Qwen3_5MoeForCausalLM` `Qwen3_5ForCausalLM` | Repeatable; first is the main model, the rest are auxiliary roots (MTP/draft head) |
+| `--kernel TAG=SUBSTR` | `prefill=fmha_fwd_hd256`, `extend=FmhaBatchPrefillWithPagedKV` | Attention kernel used to label a pass |
+| `--select-kernel` | — | Keep passes carrying this label |
+| `--select-pass` | — | Keep these pass indices |
+| `--skip-passes` / `--max-passes` | 0 / all | Drop warm-up passes / cap the count |
+| `--window` | `iteration` | `iteration` = main span + the MTP/draft span of the same iteration; `span` = main span only |
+
+### compare_per_pass.py — Per-Forward-Pass Normalized Diff
+
+`compare_analysis.py` diffs absolute totals, which only works when both traces
+hold the same number of forward passes. When two runs chunk a long prompt
+differently (25 extend chunks before a change vs 4 after), normalize first:
+
+```bash
+python3 compare_per_pass.py before.xlsx after.xlsx --passes 25 4 \
+    --labels BEFORE AFTER --category attention
+```
+
+Pass counts come straight from `extract_phase_trace.py --list`.
 
 ### compare_analysis.py — Report Comparison
 
